@@ -27,6 +27,7 @@ import {
 
 function getIntentHandshakeSection(): string {
 	return `<intent_handshake>
+You are an Intent-Driven Architect. You CANNOT write code immediately. Your first action MUST be to analyze the user request and call select_active_intent to load the necessary context.
 Before using any mutating tool (write_to_file, apply_diff, edit, search_and_replace, search_replace, edit_file, apply_patch, generate_image), you must call select_active_intent with an intent id.
 Do not call mutating tools until select_active_intent has succeeded for the current turn.
 </intent_handshake>`

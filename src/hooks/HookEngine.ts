@@ -74,6 +74,28 @@ function toUnique(values: string[]): string[] {
 }
 
 export class HookEngine {
+	private buildIntentContextXml(intent: ActiveIntentRecord): string {
+		const scopeXml =
+			intent.owned_scope.length > 0
+				? intent.owned_scope.map((pathGlob) => `    <path>${pathGlob}</path>`).join("\n")
+				: "    <path>(none)</path>"
+		const constraintsXml =
+			intent.constraints.length > 0
+				? intent.constraints.map((constraint) => `    <constraint>${constraint}</constraint>`).join("\n")
+				: "    <constraint>(none)</constraint>"
+
+		return [
+			`<intent_context id="${intent.id}">`,
+			"  <owned_scope>",
+			scopeXml,
+			"  </owned_scope>",
+			"  <constraints>",
+			constraintsXml,
+			"  </constraints>",
+			"</intent_context>",
+		].join("\n")
+	}
+
 	async preToolUse(task: Task, block: ToolUse): Promise<HookPreToolUseResult> {
 		const toolName = String(block.name)
 		const isMutatingTool = MUTATING_TOOLS.has(block.name as ToolName)
@@ -113,18 +135,16 @@ export class HookEngine {
 				const intentContextService = new IntentContextService(store)
 				const selectedIntent = await intentContextService.selectIntent(requestedIntentId)
 				if (selectedIntent.found && selectedIntent.context) {
-					const sidecarConstraintLines =
-						sidecar.architectural_constraints.length > 0
-							? sidecar.architectural_constraints.map((constraint) => `- ${constraint}`).join("\n")
-							: "- (none)"
-					const handshakeContext = [
-						"Intent reasoning intercept completed.",
-						"",
-						selectedIntent.message,
-						"",
-						"Sidecar architectural constraints:",
-						sidecarConstraintLines,
-					].join("\n")
+					const handshakeContext = this.buildIntentContextXml({
+						id: selectedIntent.context.id,
+						name: selectedIntent.context.name,
+						status: selectedIntent.context.status,
+						owned_scope: selectedIntent.context.owned_scope,
+						constraints: selectedIntent.context.constraints,
+						acceptance_criteria: selectedIntent.context.acceptance_criteria,
+						recent_history: selectedIntent.context.recent_history,
+						related_files: selectedIntent.context.related_files,
+					})
 					task.setPendingIntentHandshakeContext(handshakeContext)
 				}
 				await intentContextService.markIntentInProgress(requestedIntentId)
@@ -278,7 +298,7 @@ export class HookEngine {
 			return {
 				allowExecution: false,
 				context,
-				errorMessage: `PreToolUse denied ${toolName}: no active intent selected. Call select_active_intent before mutating code.`,
+				errorMessage: "You must cite a valid active Intent ID.",
 			}
 		}
 
@@ -297,7 +317,7 @@ export class HookEngine {
 			return {
 				allowExecution: false,
 				context,
-				errorMessage: `PreToolUse denied ${toolName}: active intent '${activeIntentId}' not found in .orchestration/active_intents.yaml.`,
+				errorMessage: "You must cite a valid active Intent ID.",
 			}
 		}
 

@@ -132,6 +132,7 @@ import { AutoApprovalHandler, checkAutoApproval } from "../auto-approval"
 import { MessageManager } from "../message-manager"
 import { validateAndFixToolResultIds } from "./validateToolResultIds"
 import { mergeConsecutiveApiMessages } from "./mergeConsecutiveApiMessages"
+import { OrchestrationStore, type ActiveIntentRecord } from "../../hooks/OrchestrationStore"
 
 const MAX_EXPONENTIAL_BACKOFF_SECONDS = 600 // 10 minutes
 const DEFAULT_USAGE_COLLECTION_TIMEOUT_MS = 5000 // 5 seconds
@@ -3825,6 +3826,8 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 			apiConfiguration,
 			enableSubfolderRules,
 		} = state ?? {}
+		const injectedIntentContext = await this.buildIntentContextInjectionForPrompt()
+		const mergedCustomInstructions = [customInstructions, injectedIntentContext].filter(Boolean).join("\n\n")
 
 		return await (async () => {
 			const provider = this.providerRef.deref()
@@ -3844,7 +3847,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 				mode ?? defaultModeSlug,
 				customModePrompts,
 				customModes,
-				customInstructions,
+				mergedCustomInstructions,
 				experiments,
 				language,
 				rooIgnoreInstructions,
@@ -3863,6 +3866,85 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 				provider.getSkillsManager(),
 			)
 		})()
+	}
+
+	private resolveSpecificationIdsForIntent(intent: ActiveIntentRecord): string[] {
+		const ids = new Set<string>()
+		ids.add(intent.id)
+
+		for (const key of ["specification_id", "requirement_id", "req_id", "spec_id"] as const) {
+			const value = intent[key]
+			if (typeof value === "string" && value.trim().length > 0) {
+				ids.add(value.trim())
+			}
+		}
+
+		return Array.from(ids)
+	}
+
+	private buildIntentContextXml(intent: ActiveIntentRecord): string {
+		const scopeXml =
+			intent.owned_scope.length > 0
+				? intent.owned_scope.map((scope) => `    <path>${scope}</path>`).join("\n")
+				: "    <path>(none)</path>"
+		const constraintsXml =
+			intent.constraints.length > 0
+				? intent.constraints.map((constraint) => `    <constraint>${constraint}</constraint>`).join("\n")
+				: "    <constraint>(none)</constraint>"
+
+		return [
+			`<intent_context id="${intent.id}">`,
+			"  <owned_scope>",
+			scopeXml,
+			"  </owned_scope>",
+			"  <constraints>",
+			constraintsXml,
+			"  </constraints>",
+			"</intent_context>",
+		].join("\n")
+	}
+
+	private async buildIntentContextInjectionForPrompt(): Promise<string | undefined> {
+		const workspacePath = this.workspacePath || this.cwd
+		if (!workspacePath) {
+			return undefined
+		}
+
+		try {
+			const store = new OrchestrationStore(workspacePath)
+			await store.ensureInitialized()
+			const intents = await store.loadIntents()
+			const activeIntent =
+				(this.activeIntentId ? intents.find((intent) => intent.id === this.activeIntentId) : undefined) ??
+				intents.find((intent) => intent.status === "IN_PROGRESS")
+			if (!activeIntent) {
+				return undefined
+			}
+
+			const specificationIds = this.resolveSpecificationIdsForIntent(activeIntent)
+			const relatedTraceRefs = await store.loadRecentTraceReferencesForSpecifications(specificationIds, 10)
+			const relatedTraceXml =
+				relatedTraceRefs.length > 0
+					? relatedTraceRefs
+							.map(
+								(ref) =>
+									`    <trace path="${ref.relative_path}" hash="${ref.content_hash}" spec="${ref.specification_value}" ts="${ref.timestamp}" />`,
+							)
+							.join("\n")
+					: "    <trace>(none)</trace>"
+
+			return [
+				"<intent_loader_context>",
+				this.buildIntentContextXml(activeIntent),
+				"  <related_trace>",
+				relatedTraceXml,
+				"  </related_trace>",
+				"</intent_loader_context>",
+			].join("\n")
+		} catch (error) {
+			console.error("Failed to build intent loader context for system prompt:", error)
+			return undefined
+		}
 	}
 
 	private getCurrentProfileId(state: any): string {

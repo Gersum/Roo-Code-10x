@@ -94,4 +94,77 @@ describe("HookEngine two-stage + HITL gating", () => {
 		expect(result.allowExecution).toBe(true)
 		expect(ask).toHaveBeenCalled()
 	})
+
+	it("returns required gatekeeper error when no valid active intent id is declared", async () => {
+		const workspacePath = await fs.mkdtemp(path.join(os.tmpdir(), "roo-hook-gatekeeper-"))
+		const task = {
+			cwd: workspacePath,
+			workspacePath,
+			taskId: "task-3",
+			activeIntentId: undefined,
+			didToolFailInCurrentTurn: false,
+			api: { getModel: () => ({ id: "gpt-test" }) },
+			getIntentCheckoutStage: () => "execution_authorized",
+			ask: vi.fn().mockResolvedValue({ response: "yesButtonClicked" }),
+		} as unknown as Task
+
+		const engine = new HookEngine()
+		const result = await engine.preToolUse(task, createMutatingToolBlock())
+
+		expect(result.allowExecution).toBe(false)
+		expect(result.errorMessage).toBe("You must cite a valid active Intent ID.")
+	})
+
+	it("injects xml intent context when intercepting select_active_intent", async () => {
+		const workspacePath = await fs.mkdtemp(path.join(os.tmpdir(), "roo-hook-select-"))
+		const orchestrationDir = path.join(workspacePath, ".orchestration")
+		await fs.mkdir(orchestrationDir, { recursive: true })
+		await fs.writeFile(
+			path.join(orchestrationDir, "active_intents.yaml"),
+			[
+				"active_intents:",
+				"  - id: INT-4",
+				"    status: PENDING",
+				'    owned_scope: ["src/auth/**", "src/middleware/jwt.ts"]',
+				'    constraints: ["No external auth providers", "Keep basic auth compatibility"]',
+				"    acceptance_criteria: []",
+				"    recent_history: []",
+				"    related_files: []",
+				"",
+			].join("\n"),
+			"utf8",
+		)
+
+		const setPendingIntentHandshakeContext = vi.fn()
+		const task = {
+			cwd: workspacePath,
+			workspacePath,
+			taskId: "task-4",
+			activeIntentId: undefined,
+			didToolFailInCurrentTurn: false,
+			api: { getModel: () => ({ id: "gpt-test" }) },
+			setPendingIntentHandshakeContext,
+			getIntentCheckoutStage: () => "checkout_required",
+		} as unknown as Task
+
+		const block: ToolUse<"select_active_intent"> = {
+			type: "tool_use",
+			name: "select_active_intent",
+			params: { intent_id: "INT-4" },
+			partial: false,
+			nativeArgs: { intent_id: "INT-4" },
+		}
+
+		const engine = new HookEngine()
+		const result = await engine.preToolUse(task, block)
+
+		expect(result.allowExecution).toBe(true)
+		expect(setPendingIntentHandshakeContext).toHaveBeenCalledTimes(1)
+		const xml = setPendingIntentHandshakeContext.mock.calls[0][0] as string
+		expect(xml).toContain("<intent_context")
+		expect(xml).toContain("<owned_scope>")
+		expect(xml).toContain("<constraints>")
+		expect(xml).toContain("src/auth/**")
+		expect(xml).toContain("No external auth providers")
+	})
 })

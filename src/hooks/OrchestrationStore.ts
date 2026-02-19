@@ -58,6 +58,13 @@ export interface AgentTraceRecord {
 	}
 }
 
+export interface AgentTraceReference {
+	timestamp: string
+	relative_path: string
+	content_hash: string
+	specification_value: string
+}
+
 export interface SidecarDenyMutationRule {
 	path_glob: string
 	reason?: string
@@ -382,6 +389,56 @@ export class OrchestrationStore {
 		}
 		this.validateTraceRecord(recordWithIntegrity)
 		await fs.appendFile(this.agentTracePath, `${JSON.stringify(recordWithIntegrity)}\n`, "utf8")
+	}
+
+	async loadRecentTraceReferencesForSpecifications(
+		specificationIds: string[],
+		limit: number = 20,
+	): Promise<AgentTraceReference[]> {
+		await this.ensureInitialized()
+		const targets = new Set(specificationIds.map((id) => id.trim()).filter(Boolean))
+		if (targets.size === 0) {
+			return []
+		}
+
+		const raw = await fs.readFile(this.agentTracePath, "utf8")
+		const lines = raw
+			.split(/\r?\n/)
+			.map((line) => line.trim())
+			.filter(Boolean)
+		if (lines.length === 0) {
+			return []
+		}
+
+		const refs: AgentTraceReference[] = []
+		for (const line of lines) {
+			let parsed: AgentTraceRecord
+			try {
+				parsed = JSON.parse(line) as AgentTraceRecord
+			} catch {
+				continue
+			}
+
+			for (const file of parsed.files ?? []) {
+				for (const conversation of file.conversations ?? []) {
+					for (const related of conversation.related ?? []) {
+						if (related.type !== "specification" || !targets.has(related.value)) {
+							continue
+						}
+						for (const range of conversation.ranges ?? []) {
+							refs.push({
+								timestamp: parsed.timestamp,
+								relative_path: file.relative_path,
+								content_hash: range.content_hash,
+								specification_value: related.value,
+							})
+						}
+					}
+				}
+			}
+		}
+
+		return refs.sort((a, b) => b.timestamp.localeCompare(a.timestamp)).slice(0, limit)
 	}
 
 	async appendIntentMapEntry(
