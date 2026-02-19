@@ -1,6 +1,5 @@
 import * as path from "path"
 import * as vscode from "vscode"
-import os from "os"
 import crypto from "crypto"
 import { v7 as uuidv7 } from "uuid"
 import EventEmitter from "events"
@@ -90,6 +89,7 @@ import { calculateApiCostAnthropic, calculateApiCostOpenAI } from "../../shared/
 import { getWorkspacePath } from "../../utils/path"
 import { sanitizeToolUseId } from "../../utils/tool-id"
 import { getTaskDirectoryPath } from "../../utils/storage"
+import { appendChatTrace, compact as compactTrace } from "../../utils/chatTrace"
 
 // prompts
 import { formatResponse } from "../prompts/responses"
@@ -322,6 +322,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 	consecutiveMistakeLimit: number
 	consecutiveMistakeCountForApplyDiff: Map<string, number> = new Map()
 	consecutiveMistakeCountForEditFile: Map<string, number> = new Map()
+	private _activeIntentId: string | undefined
 	consecutiveNoToolUseCount: number = 0
 	consecutiveNoAssistantMessagesCount: number = 0
 	toolUsage: ToolUsage = {}
@@ -472,9 +473,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		}
 
 		// Normal use-case is usually retry similar history task with new workspace.
-		this.workspacePath = parentTask
-			? parentTask.workspacePath
-			: (workspacePath ?? getWorkspacePath(path.join(os.homedir(), "Desktop")))
+		this.workspacePath = parentTask ? parentTask.workspacePath : (workspacePath ?? getWorkspacePath())
 
 		this.instanceId = crypto.randomUUID().slice(0, 8)
 		this.taskNumber = -1
@@ -843,6 +842,14 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		this._taskApiConfigName = apiConfigName
 	}
 
+	public get activeIntentId(): string | undefined {
+		return this._activeIntentId
+	}
+
+	public setActiveIntentId(intentId: string | undefined): void {
+		this._activeIntentId = intentId?.trim() || undefined
+	}
+
 	static create(options: TaskOptions): [Task, Promise<void>] {
 		const instance = new Task({ ...options, startTask: false })
 		const { images, task, historyItem } = options
@@ -1166,6 +1173,16 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		await provider?.postStateToWebviewWithoutTaskHistory()
 		this.emit(RooCodeEventName.Message, { action: "created", message })
 		await this.saveClineMessages()
+
+		// Append compact trace entry for chat activity (non-blocking)
+		try {
+			void appendChatTrace(
+				this.cwd,
+				`message:created taskId=${this.taskId} type=${message.type}${message.say ? `/${message.say}` : ""} ts=${message.ts} text="${compactTrace(message.text)}"`,
+			)
+		} catch (err) {
+			/* swallow */
+		}
 
 		const shouldCaptureMessage = message.partial !== true && CloudService.isEnabled()
 
