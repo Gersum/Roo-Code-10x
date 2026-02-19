@@ -869,6 +869,15 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		this._intentCheckoutStage = "execution_authorized"
 	}
 
+	private containsExplicitUserTurnContent(content: Anthropic.Messages.ContentBlockParam[]): boolean {
+		return content.some((block) => {
+			if (block.type !== "text" || typeof block.text !== "string") {
+				return false
+			}
+			return block.text.includes("<user_message>")
+		})
+	}
+
 	public setPendingIntentHandshakeContext(context: string | undefined): void {
 		this._pendingIntentHandshakeContext = context?.trim() || undefined
 	}
@@ -2702,6 +2711,9 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 			const isEmptyUserContent = currentUserContent.length === 0
 			const shouldAddUserMessage =
 				((currentItem.retryAttempt ?? 0) === 0 && !isEmptyUserContent) || currentItem.userMessageWasRemoved
+			if (shouldAddUserMessage && this.containsExplicitUserTurnContent(currentUserContent)) {
+				this.resetIntentCheckoutForTurn()
+			}
 			if (shouldAddUserMessage) {
 				await this.addToApiConversationHistory({ role: "user", content: finalUserContent })
 				TelemetryService.instance.captureConversationMessage(this.taskId, "user")
@@ -2812,7 +2824,6 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 				this.didRejectTool = false
 				this.didAlreadyUseTool = false
 				this.assistantMessageSavedToHistory = false
-				this.resetIntentCheckoutForTurn()
 				// Reset tool failure flag for each new assistant turn - this ensures that tool failures
 				// only prevent attempt_completion within the same assistant message, not across turns
 				// (e.g., if a tool fails, then user sends a message saying "just complete anyway")

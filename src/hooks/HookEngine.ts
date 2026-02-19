@@ -157,6 +157,20 @@ export class HookEngine {
 			return { allowExecution: true, context }
 		}
 
+		const activeIntentsRelativePath = path.posix.join(
+			OrchestrationStore.ORCHESTRATION_DIR,
+			OrchestrationStore.ACTIVE_INTENTS_FILE,
+		)
+		const touchesOnlyActiveIntentsFile =
+			extractedPaths.insideWorkspacePaths.length > 0 &&
+			extractedPaths.outsideWorkspacePaths.length === 0 &&
+			extractedPaths.insideWorkspacePaths.every((relativePath) => relativePath === activeIntentsRelativePath)
+		let isActiveIntentBootstrapMutation = false
+		if (touchesOnlyActiveIntentsFile) {
+			const intents = await store.loadIntents()
+			isActiveIntentBootstrapMutation = intents.length === 0
+		}
+
 		// Two-stage turn state machine:
 		// stage 1: checkout_required (must call select_active_intent first)
 		// stage 2: execution_authorized (mutating tools allowed)
@@ -167,7 +181,7 @@ export class HookEngine {
 			typeof (task as Task & { getIntentCheckoutStage?: () => string }).getIntentCheckoutStage === "function"
 				? (task as Task & { getIntentCheckoutStage: () => string }).getIntentCheckoutStage()
 				: "execution_authorized"
-		if (stage !== "execution_authorized") {
+		if (stage !== "execution_authorized" && !isActiveIntentBootstrapMutation) {
 			await store.appendGovernanceEntry({
 				intent_id: task.activeIntentId,
 				tool_name: toolName,
@@ -243,7 +257,10 @@ export class HookEngine {
 			const deniedBySidecar = extractedPaths.insideWorkspacePaths.filter((relativePath) =>
 				sidecar.deny_mutations.some((rule) => this.pathMatchesOwnedScope(relativePath, [rule.path_glob])),
 			)
-			if (deniedBySidecar.length > 0) {
+			const deniedBySidecarAfterControlPlaneException = deniedBySidecar.filter(
+				(relativePath) => relativePath !== activeIntentsRelativePath,
+			)
+			if (deniedBySidecarAfterControlPlaneException.length > 0) {
 				await store.appendGovernanceEntry({
 					intent_id: task.activeIntentId,
 					tool_name: toolName,
@@ -259,7 +276,7 @@ export class HookEngine {
 					context,
 					errorMessage:
 						`PreToolUse denied ${toolName}: sidecar policy v${sidecar.version} denies mutation for path(s): ` +
-						`${deniedBySidecar.join(", ")}.`,
+						`${deniedBySidecarAfterControlPlaneException.join(", ")}.`,
 				}
 			}
 		}
@@ -282,6 +299,42 @@ export class HookEngine {
 					`PreToolUse denied ${toolName}: attempted to mutate paths outside the workspace boundary. ` +
 					`Paths: ${extractedPaths.outsideWorkspacePaths.join(", ")}`,
 			}
+		}
+
+		if (isActiveIntentBootstrapMutation) {
+			// Bootstrap path: permit the first active_intents.yaml mutation so teams can initialize
+			// intent governance from an empty state without disabling hooks.
+			if (typeof (task as Task & { ask?: unknown }).ask === "function") {
+				const hitlPayload = JSON.stringify({
+					tool: "preToolAuthorization",
+					requested_tool: toolName,
+					intent_id: "INTENT-BOOTSTRAP",
+					paths: context.touchedPaths,
+				})
+				const { response, text } = await task.ask("tool", hitlPayload)
+				if (response !== "yesButtonClicked") {
+					const feedback = typeof text === "string" && text.trim().length > 0 ? ` Feedback: ${text}` : ""
+					await store.appendGovernanceEntry({
+						tool_name: toolName,
+						status: "DENIED",
+						task_id: task.taskId,
+						model_identifier: task.api.getModel().id,
+						revision_id: await this.getGitRevision(task.cwd),
+						touched_paths: context.touchedPaths,
+						sidecar_constraints: context.sidecarConstraints,
+					})
+					return {
+						allowExecution: false,
+						context,
+						errorMessage: `PreToolUse denied ${toolName}: HITL authorization was not approved.${feedback}`,
+					}
+				}
+			}
+
+			await store.appendSharedBrainEntry(
+				"Bootstrap mutation approved for .orchestration/active_intents.yaml with no existing intents.",
+			)
+			return { allowExecution: true, context }
 		}
 
 		const activeIntentId = task.activeIntentId?.trim()
@@ -324,8 +377,11 @@ export class HookEngine {
 		context.intentId = intent.id
 		context.intent = intent
 
-		if (intent.owned_scope.length > 0 && extractedPaths.insideWorkspacePaths.length > 0) {
-			const disallowedPaths = extractedPaths.insideWorkspacePaths.filter(
+		const scopeCheckedPaths = extractedPaths.insideWorkspacePaths.filter(
+			(relativePath) => relativePath !== activeIntentsRelativePath,
+		)
+		if (intent.owned_scope.length > 0 && scopeCheckedPaths.length > 0) {
+			const disallowedPaths = scopeCheckedPaths.filter(
 				(filePath) => !this.pathMatchesOwnedScope(filePath, intent.owned_scope),
 			)
 

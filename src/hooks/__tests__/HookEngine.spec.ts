@@ -17,6 +17,26 @@ function createMutatingToolBlock(): ToolUse {
 	}
 }
 
+function createActiveIntentsMutationBlock(toolName: ToolUse["name"] = "write_to_file"): ToolUse {
+	if (toolName === "apply_diff") {
+		return {
+			type: "tool_use",
+			name: "apply_diff",
+			params: { path: ".orchestration/active_intents.yaml", diff: "@@ -1 +1 @@" },
+			partial: false,
+			nativeArgs: { path: ".orchestration/active_intents.yaml", diff: "@@ -1 +1 @@" },
+		} as ToolUse
+	}
+
+	return {
+		type: "tool_use",
+		name: "write_to_file",
+		params: { path: ".orchestration/active_intents.yaml", content: "active_intents: []\n" },
+		partial: false,
+		nativeArgs: { path: ".orchestration/active_intents.yaml", content: "active_intents: []\n" },
+	}
+}
+
 describe("HookEngine two-stage + HITL gating", () => {
 	it("denies mutating tools when intent checkout is not authorized for the turn", async () => {
 		const workspacePath = await fs.mkdtemp(path.join(os.tmpdir(), "roo-hook-stage-"))
@@ -166,5 +186,65 @@ describe("HookEngine two-stage + HITL gating", () => {
 		expect(xml).toContain("<constraints>")
 		expect(xml).toContain("src/auth/**")
 		expect(xml).toContain("No external auth providers")
+	})
+
+	it("allows bootstrap mutation of active_intents.yaml when no intents exist", async () => {
+		const workspacePath = await fs.mkdtemp(path.join(os.tmpdir(), "roo-hook-bootstrap-"))
+		const ask = vi.fn().mockResolvedValue({ response: "yesButtonClicked" })
+		const task = {
+			cwd: workspacePath,
+			workspacePath,
+			taskId: "task-5",
+			activeIntentId: undefined,
+			didToolFailInCurrentTurn: false,
+			api: { getModel: () => ({ id: "gpt-test" }) },
+			getIntentCheckoutStage: () => "checkout_required",
+			ask,
+		} as unknown as Task
+
+		const engine = new HookEngine()
+		const result = await engine.preToolUse(task, createActiveIntentsMutationBlock("apply_diff"))
+
+		expect(result.allowExecution).toBe(true)
+		expect(ask).toHaveBeenCalled()
+	})
+
+	it("allows active_intents.yaml updates when an active intent is checked out", async () => {
+		const workspacePath = await fs.mkdtemp(path.join(os.tmpdir(), "roo-hook-control-plane-"))
+		const orchestrationDir = path.join(workspacePath, ".orchestration")
+		await fs.mkdir(orchestrationDir, { recursive: true })
+		await fs.writeFile(
+			path.join(orchestrationDir, "active_intents.yaml"),
+			[
+				"active_intents:",
+				"  - id: INT-6",
+				"    status: IN_PROGRESS",
+				'    owned_scope: ["src/**"]',
+				"    constraints: []",
+				"    acceptance_criteria: []",
+				"    recent_history: []",
+				"    related_files: []",
+				"",
+			].join("\n"),
+			"utf8",
+		)
+
+		const ask = vi.fn().mockResolvedValue({ response: "yesButtonClicked" })
+		const task = {
+			cwd: workspacePath,
+			workspacePath,
+			taskId: "task-6",
+			activeIntentId: "INT-6",
+			didToolFailInCurrentTurn: false,
+			api: { getModel: () => ({ id: "gpt-test" }) },
+			getIntentCheckoutStage: () => "execution_authorized",
+			ask,
+		} as unknown as Task
+
+		const engine = new HookEngine()
+		const result = await engine.preToolUse(task, createActiveIntentsMutationBlock())
+
+		expect(result.allowExecution).toBe(true)
+		expect(ask).toHaveBeenCalled()
 	})
 })
