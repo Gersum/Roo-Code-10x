@@ -180,6 +180,14 @@ const DEFAULT_SIDECAR_POLICY_YAML = [
 	'      reason: "Orchestration control-plane files are hook-managed."',
 	"",
 ].join("\n")
+const DEFAULT_INTENT_IGNORE = [
+	"# .intentignore",
+	"# One intent id or glob per line (supports * and **).",
+	"# Examples:",
+	"# INT-001",
+	"# INT-*",
+	"",
+].join("\n")
 
 function normalizeStringArray(value: unknown): string[] {
 	if (!Array.isArray(value)) {
@@ -258,6 +266,7 @@ export class OrchestrationStore {
 	static readonly SHARED_BRAIN_FILE = "AGENT.md"
 	static readonly GOVERNANCE_LEDGER_FILE = "governance_ledger.md"
 	static readonly SIDECAR_POLICY_FILE = "constraints.sidecar.yaml"
+	static readonly INTENT_IGNORE_FILE = ".intentignore"
 	static readonly REQUIRED_ORCHESTRATION_FILES = [
 		OrchestrationStore.ACTIVE_INTENTS_FILE,
 		OrchestrationStore.AGENT_TRACE_FILE,
@@ -296,6 +305,10 @@ export class OrchestrationStore {
 		return path.join(this.orchestrationDirPath, OrchestrationStore.SIDECAR_POLICY_FILE)
 	}
 
+	get intentIgnorePath(): string {
+		return path.join(this.workspacePath, OrchestrationStore.INTENT_IGNORE_FILE)
+	}
+
 	async ensureInitialized(): Promise<void> {
 		await fs.mkdir(this.orchestrationDirPath, { recursive: true })
 		await this.ensureFile(this.activeIntentsPath, DEFAULT_ACTIVE_INTENTS_YAML)
@@ -304,6 +317,16 @@ export class OrchestrationStore {
 		await this.ensureFile(this.sharedBrainPath, DEFAULT_SHARED_BRAIN_MD)
 		await this.ensureFile(this.governanceLedgerPath, DEFAULT_GOVERNANCE_LEDGER_MD)
 		await this.ensureFile(this.sidecarPolicyPath, DEFAULT_SIDECAR_POLICY_YAML)
+		await this.ensureFile(this.intentIgnorePath, DEFAULT_INTENT_IGNORE)
+	}
+
+	async loadIntentIgnorePatterns(): Promise<string[]> {
+		await this.ensureInitialized()
+		const raw = await fs.readFile(this.intentIgnorePath, "utf8")
+		return raw
+			.split(/\r?\n/)
+			.map((line) => line.trim())
+			.filter((line) => line.length > 0 && !line.startsWith("#"))
 	}
 
 	async loadIntents(): Promise<ActiveIntentRecord[]> {

@@ -3,6 +3,7 @@ import fs from "fs/promises"
 import path from "path"
 import { execFile } from "child_process"
 import { promisify } from "util"
+import * as vscode from "vscode"
 
 import type { ToolName } from "@roo-code/types"
 
@@ -26,6 +27,9 @@ const MUTATING_TOOLS = new Set<ToolName>([
 ])
 
 const APPLY_PATCH_FILE_MARKERS = ["*** Add File: ", "*** Delete File: ", "*** Update File: ", "*** Move to: "] as const
+const INTENT_IGNORE_FEEDBACK_LIMIT = 3
+
+type CommandClassification = "safe" | "destructive"
 
 interface ExtractedPaths {
 	insideWorkspacePaths: string[]
@@ -35,6 +39,7 @@ interface ExtractedPaths {
 export interface HookPreToolUseContext {
 	toolName: string
 	isMutatingTool: boolean
+	commandClassification: CommandClassification
 	intentId?: string
 	intent?: ActiveIntentRecord
 	touchedPaths: string[]
@@ -96,9 +101,114 @@ export class HookEngine {
 		].join("\n")
 	}
 
+	private classifyExecuteCommand(block: ToolUse): CommandClassification {
+		if (block.name !== "execute_command") {
+			return "safe"
+		}
+		const nativeArgs = (block.nativeArgs as Record<string, unknown> | undefined) ?? {}
+		const command = normalizePathLike(nativeArgs.command ?? block.params.command)?.toLowerCase()
+		if (!command) {
+			return "destructive"
+		}
+
+		const destructivePatterns = [
+			/\brm\b/,
+			/\bmv\b/,
+			/\bcp\b/,
+			/\bchmod\b/,
+			/\bchown\b/,
+			/\bmkdir\b/,
+			/\brmdir\b/,
+			/\bsed\s+-i\b/,
+			/\btee\b/,
+			/\bgit\s+(add|commit|merge|rebase|reset|clean|checkout)\b/,
+			/\bnpm\s+(publish|version)\b/,
+			/\bpnpm\s+(publish|version)\b/,
+			/\byarn\s+(publish|version)\b/,
+			/\bpython\b.*\b(open|write|remove|unlink)\b/,
+			/\bnode\b/,
+			/>/,
+		]
+		const safeAllowPatterns = [
+			/^\s*(ls|cat|pwd|echo|whoami|date|rg|find|git\s+status|git\s+log|git\s+show|git\s+rev-parse)\b/,
+		]
+		if (safeAllowPatterns.some((pattern) => pattern.test(command))) {
+			return "safe"
+		}
+		return destructivePatterns.some((pattern) => pattern.test(command)) ? "destructive" : "safe"
+	}
+
+	private buildHookToolError(code: string, message: string, details?: Record<string, unknown>): string {
+		return JSON.stringify(
+			{
+				error: {
+					type: "HOOK_PRE_TOOL_DENIED",
+					code,
+					message,
+					...(details ? { details } : {}),
+				},
+			},
+			null,
+			0,
+		)
+	}
+
+	private intentMatchesIgnorePattern(intentId: string, pattern: string): boolean {
+		if (!pattern.trim()) {
+			return false
+		}
+		const regex = globToRegExp(pattern.trim())
+		return regex.test(intentId)
+	}
+
+	private async requestHitlAuthorization(
+		task: Task,
+		toolName: string,
+		intentId: string,
+		paths: string[],
+	): Promise<{ approved: boolean; feedback?: string }> {
+		const warningMessage = `Approve ${toolName} for intent ${intentId}?`
+		const detail = paths.length > 0 ? `Paths: ${paths.join(", ")}` : "No explicit path targets detected."
+		try {
+			const decision = await vscode.window.showWarningMessage(
+				warningMessage,
+				{ modal: true, detail },
+				"Approve",
+				"Reject",
+			)
+			if (decision === "Reject") {
+				return { approved: false, feedback: "Rejected from VS Code warning gate." }
+			}
+			if (decision === "Approve") {
+				return { approved: true }
+			}
+		} catch {
+			// Fall through to task.ask gate below.
+		}
+
+		if (typeof (task as Task & { ask?: unknown }).ask === "function") {
+			const hitlPayload = JSON.stringify({
+				tool: "preToolAuthorization",
+				requested_tool: toolName,
+				intent_id: intentId,
+				paths,
+			})
+			const { response, text } = await task.ask("tool", hitlPayload)
+			if (response === "yesButtonClicked") {
+				return { approved: true }
+			}
+			return { approved: false, feedback: typeof text === "string" ? text : undefined }
+		}
+
+		return { approved: true }
+	}
+
 	async preToolUse(task: Task, block: ToolUse): Promise<HookPreToolUseResult> {
 		const toolName = String(block.name)
-		const isMutatingTool = MUTATING_TOOLS.has(block.name as ToolName)
+		const commandClassification = this.classifyExecuteCommand(block)
+		const isMutatingTool =
+			MUTATING_TOOLS.has(block.name as ToolName) ||
+			(block.name === "execute_command" && commandClassification === "destructive")
 		const workspacePath = this.getWorkspacePath(task)
 		if (!workspacePath) {
 			return {
@@ -106,6 +216,7 @@ export class HookEngine {
 				context: {
 					toolName,
 					isMutatingTool,
+					commandClassification,
 					touchedPaths: [],
 					sidecarConstraints: [],
 					sidecarVersion: 1,
@@ -123,6 +234,7 @@ export class HookEngine {
 		const context: HookPreToolUseContext = {
 			toolName,
 			isMutatingTool,
+			commandClassification,
 			touchedPaths: extractedPaths.insideWorkspacePaths,
 			sidecarConstraints: sidecar.architectural_constraints,
 			sidecarVersion: sidecar.version,
@@ -304,30 +416,25 @@ export class HookEngine {
 		if (isActiveIntentBootstrapMutation) {
 			// Bootstrap path: permit the first active_intents.yaml mutation so teams can initialize
 			// intent governance from an empty state without disabling hooks.
-			if (typeof (task as Task & { ask?: unknown }).ask === "function") {
-				const hitlPayload = JSON.stringify({
-					tool: "preToolAuthorization",
-					requested_tool: toolName,
-					intent_id: "INTENT-BOOTSTRAP",
-					paths: context.touchedPaths,
+			const hitl = await this.requestHitlAuthorization(task, toolName, "INTENT-BOOTSTRAP", context.touchedPaths)
+			if (!hitl.approved) {
+				await store.appendGovernanceEntry({
+					tool_name: toolName,
+					status: "DENIED",
+					task_id: task.taskId,
+					model_identifier: task.api.getModel().id,
+					revision_id: await this.getGitRevision(task.cwd),
+					touched_paths: context.touchedPaths,
+					sidecar_constraints: context.sidecarConstraints,
 				})
-				const { response, text } = await task.ask("tool", hitlPayload)
-				if (response !== "yesButtonClicked") {
-					const feedback = typeof text === "string" && text.trim().length > 0 ? ` Feedback: ${text}` : ""
-					await store.appendGovernanceEntry({
+				return {
+					allowExecution: false,
+					context,
+					errorMessage: this.buildHookToolError("HITL_REJECTED", "Mutation rejected by authorization gate.", {
 						tool_name: toolName,
-						status: "DENIED",
-						task_id: task.taskId,
-						model_identifier: task.api.getModel().id,
-						revision_id: await this.getGitRevision(task.cwd),
-						touched_paths: context.touchedPaths,
-						sidecar_constraints: context.sidecarConstraints,
-					})
-					return {
-						allowExecution: false,
-						context,
-						errorMessage: `PreToolUse denied ${toolName}: HITL authorization was not approved.${feedback}`,
-					}
+						intent_id: "INTENT-BOOTSTRAP",
+						feedback: hitl.feedback,
+					}),
 				}
 			}
 
@@ -377,6 +484,35 @@ export class HookEngine {
 		context.intentId = intent.id
 		context.intent = intent
 
+		const ignoredIntentPatterns = await store.loadIntentIgnorePatterns()
+		const matchedIgnoredPatterns = ignoredIntentPatterns.filter((pattern) =>
+			this.intentMatchesIgnorePattern(intent.id, pattern),
+		)
+		if (matchedIgnoredPatterns.length > 0) {
+			await store.appendGovernanceEntry({
+				intent_id: intent.id,
+				tool_name: toolName,
+				status: "DENIED",
+				task_id: task.taskId,
+				model_identifier: task.api.getModel().id,
+				revision_id: await this.getGitRevision(task.cwd),
+				touched_paths: context.touchedPaths,
+				sidecar_constraints: context.sidecarConstraints,
+			})
+			return {
+				allowExecution: false,
+				context,
+				errorMessage: this.buildHookToolError(
+					"INTENT_IGNORED",
+					`Intent ${intent.id} is excluded by .intentignore and cannot mutate code in this session.`,
+					{
+						intent_id: intent.id,
+						matched_patterns: matchedIgnoredPatterns.slice(0, INTENT_IGNORE_FEEDBACK_LIMIT),
+					},
+				),
+			}
+		}
+
 		const scopeCheckedPaths = extractedPaths.insideWorkspacePaths.filter(
 			(relativePath) => relativePath !== activeIntentsRelativePath,
 		)
@@ -403,8 +539,9 @@ export class HookEngine {
 					allowExecution: false,
 					context,
 					errorMessage:
-						`PreToolUse denied ${toolName}: path(s) outside owned_scope for intent ${intent.id}. ` +
-						`Disallowed: ${disallowedPaths.join(", ")}`,
+						toolName === "write_to_file"
+							? `Scope Violation: ${this.resolveSpecificationReference(intent.id, intent)} is not authorized to edit ${disallowedPaths[0]}. Request scope expansion.`
+							: `PreToolUse denied ${toolName}: path(s) outside owned_scope for intent ${intent.id}. Disallowed: ${disallowedPaths.join(", ")}`,
 				}
 			}
 		}
@@ -414,31 +551,26 @@ export class HookEngine {
 
 		// Human-in-the-loop authorization gate in pre-hook for mutating tools.
 		// For production Task instances, we require explicit approval before tool execution.
-		if (typeof (task as Task & { ask?: unknown }).ask === "function") {
-			const hitlPayload = JSON.stringify({
-				tool: "preToolAuthorization",
-				requested_tool: toolName,
+		const hitl = await this.requestHitlAuthorization(task, toolName, intent.id, context.touchedPaths)
+		if (!hitl.approved) {
+			await store.appendGovernanceEntry({
 				intent_id: intent.id,
-				paths: context.touchedPaths,
+				tool_name: toolName,
+				status: "DENIED",
+				task_id: task.taskId,
+				model_identifier: task.api.getModel().id,
+				revision_id: await this.getGitRevision(task.cwd),
+				touched_paths: context.touchedPaths,
+				sidecar_constraints: context.sidecarConstraints,
 			})
-			const { response, text } = await task.ask("tool", hitlPayload)
-			if (response !== "yesButtonClicked") {
-				const feedback = typeof text === "string" && text.trim().length > 0 ? ` Feedback: ${text}` : ""
-				await store.appendGovernanceEntry({
-					intent_id: intent.id,
+			return {
+				allowExecution: false,
+				context,
+				errorMessage: this.buildHookToolError("HITL_REJECTED", "Mutation rejected by authorization gate.", {
 					tool_name: toolName,
-					status: "DENIED",
-					task_id: task.taskId,
-					model_identifier: task.api.getModel().id,
-					revision_id: await this.getGitRevision(task.cwd),
-					touched_paths: context.touchedPaths,
-					sidecar_constraints: context.sidecarConstraints,
-				})
-				return {
-					allowExecution: false,
-					context,
-					errorMessage: `PreToolUse denied ${toolName}: HITL authorization was not approved.${feedback}`,
-				}
+					intent_id: intent.id,
+					feedback: hitl.feedback,
+				}),
 			}
 		}
 

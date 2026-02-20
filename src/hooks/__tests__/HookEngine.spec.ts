@@ -17,6 +17,16 @@ function createMutatingToolBlock(): ToolUse {
 	}
 }
 
+function createExecuteCommandBlock(command: string): ToolUse {
+	return {
+		type: "tool_use",
+		name: "execute_command",
+		params: { command },
+		partial: false,
+		nativeArgs: { command },
+	} as ToolUse
+}
+
 function createActiveIntentsMutationBlock(toolName: ToolUse["name"] = "write_to_file"): ToolUse {
 	if (toolName === "apply_diff") {
 		return {
@@ -246,5 +256,82 @@ describe("HookEngine two-stage + HITL gating", () => {
 
 		expect(result.allowExecution).toBe(true)
 		expect(ask).toHaveBeenCalled()
+	})
+
+	it("classifies destructive execute_command as mutating and enforces checkout", async () => {
+		const workspacePath = await fs.mkdtemp(path.join(os.tmpdir(), "roo-hook-cmd-destructive-"))
+		const task = {
+			cwd: workspacePath,
+			workspacePath,
+			taskId: "task-7",
+			activeIntentId: undefined,
+			didToolFailInCurrentTurn: false,
+			api: { getModel: () => ({ id: "gpt-test" }) },
+			getIntentCheckoutStage: () => "checkout_required",
+			ask: vi.fn().mockResolvedValue({ response: "yesButtonClicked" }),
+		} as unknown as Task
+
+		const engine = new HookEngine()
+		const result = await engine.preToolUse(task, createExecuteCommandBlock("rm -rf ./tmp"))
+
+		expect(result.allowExecution).toBe(false)
+		expect(result.errorMessage).toContain("intent checkout required")
+	})
+
+	it("allows safe execute_command without intent checkout", async () => {
+		const workspacePath = await fs.mkdtemp(path.join(os.tmpdir(), "roo-hook-cmd-safe-"))
+		const task = {
+			cwd: workspacePath,
+			workspacePath,
+			taskId: "task-8",
+			activeIntentId: undefined,
+			didToolFailInCurrentTurn: false,
+			api: { getModel: () => ({ id: "gpt-test" }) },
+			getIntentCheckoutStage: () => "checkout_required",
+		} as unknown as Task
+
+		const engine = new HookEngine()
+		const result = await engine.preToolUse(task, createExecuteCommandBlock("rg -n todo src"))
+
+		expect(result.allowExecution).toBe(true)
+	})
+
+	it("blocks ignored intents from mutating when matched by .intentignore", async () => {
+		const workspacePath = await fs.mkdtemp(path.join(os.tmpdir(), "roo-hook-intent-ignore-"))
+		await fs.writeFile(path.join(workspacePath, ".intentignore"), "INT-9\n", "utf8")
+		const orchestrationDir = path.join(workspacePath, ".orchestration")
+		await fs.mkdir(orchestrationDir, { recursive: true })
+		await fs.writeFile(
+			path.join(orchestrationDir, "active_intents.yaml"),
+			[
+				"active_intents:",
+				"  - id: INT-9",
+				"    status: IN_PROGRESS",
+				'    owned_scope: ["src/**"]',
+				"    constraints: []",
+				"    acceptance_criteria: []",
+				"    recent_history: []",
+				"    related_files: []",
+				"",
+			].join("\n"),
+			"utf8",
+		)
+
+		const task = {
+			cwd: workspacePath,
+			workspacePath,
+			taskId: "task-9",
+			activeIntentId: "INT-9",
+			didToolFailInCurrentTurn: false,
+			api: { getModel: () => ({ id: "gpt-test" }) },
+			getIntentCheckoutStage: () => "execution_authorized",
+			ask: vi.fn().mockResolvedValue({ response: "yesButtonClicked" }),
+		} as unknown as Task
+
+		const engine = new HookEngine()
+		const result = await engine.preToolUse(task, createMutatingToolBlock())
+
+		expect(result.allowExecution).toBe(false)
+		expect(result.errorMessage).toContain('"code":"INTENT_IGNORED"')
 	})
 })
