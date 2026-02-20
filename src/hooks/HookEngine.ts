@@ -12,6 +12,7 @@ import { Task } from "../core/task/Task"
 import { type ActiveIntentRecord, type AgentTraceRecord, OrchestrationStore } from "./OrchestrationStore"
 import { IntentContextService } from "./IntentContextService"
 import { parseSourceCodeDefinitionsForFile } from "../services/tree-sitter"
+import { sha256OfBuffer, sha256OfString } from "../utils/hash"
 
 const execFileAsync = promisify(execFile)
 
@@ -30,6 +31,7 @@ const APPLY_PATCH_FILE_MARKERS = ["*** Add File: ", "*** Delete File: ", "*** Up
 const INTENT_IGNORE_FEEDBACK_LIMIT = 3
 
 type CommandClassification = "safe" | "destructive"
+type MutationClass = "AST_REFACTOR" | "INTENT_EVOLUTION"
 
 interface ExtractedPaths {
 	insideWorkspacePaths: string[]
@@ -786,6 +788,18 @@ export class HookEngine {
 		}
 	}
 
+	private extractMutationClass(block?: ToolUse): MutationClass | undefined {
+		if (!block || block.name !== "write_to_file") {
+			return undefined
+		}
+		const nativeArgs = (block.nativeArgs as Record<string, unknown> | undefined) ?? {}
+		const raw = normalizePathLike(nativeArgs.mutation_class ?? block.params.mutation_class)
+		if (raw === "AST_REFACTOR" || raw === "INTENT_EVOLUTION") {
+			return raw
+		}
+		return undefined
+	}
+
 	private resolveSpecificationReference(intentId: string, intent?: ActiveIntentRecord): string {
 		const candidateKeys = ["specification_id", "requirement_id", "req_id", "spec_id"] as const
 		for (const key of candidateKeys) {
@@ -814,27 +828,26 @@ export class HookEngine {
 				fileBuffer = Buffer.alloc(0)
 			}
 
-			const contentHash = `sha256:${crypto.createHash("sha256").update(fileBuffer).digest("hex")}`
+			const contentHash = sha256OfBuffer(fileBuffer)
 			const text = fileBuffer.toString("utf8")
 			const lineCount = text.length === 0 ? 0 : text.split(/\r?\n/).length
 			const payloadText = block ? this.extractToolPayloadForPath(block, relativePath) : undefined
 			const payloadLineCount = payloadText ? payloadText.split(/\r?\n/).length : 0
 			const rangeStart = payloadText ? 1 : lineCount > 0 ? 1 : 0
 			const rangeEnd = payloadText ? payloadLineCount : lineCount
-			const rangeHash = payloadText
-				? `sha256:${crypto.createHash("sha256").update(payloadText).digest("hex")}`
-				: contentHash
+			const rangeHash = payloadText ? sha256OfString(payloadText) : contentHash
 			let astSummaryHash: string | undefined
 			try {
 				const astSummary = await parseSourceCodeDefinitionsForFile(absolutePath)
 				if (astSummary && astSummary.trim().length > 0) {
-					astSummaryHash = `sha256:${crypto.createHash("sha256").update(astSummary).digest("hex")}`
+					astSummaryHash = sha256OfString(astSummary)
 				}
 			} catch {
 				// Best-effort AST extraction for trace linkage.
 			}
 
 			const specificationRef = this.resolveSpecificationReference(context.intentId!, context.intent)
+			const mutationClass = this.extractMutationClass(block)
 			files.push({
 				relative_path: relativePath,
 				...(astSummaryHash
@@ -859,7 +872,10 @@ export class HookEngine {
 								content_hash: rangeHash,
 							},
 						],
-						related: [{ type: "specification" as const, value: specificationRef }],
+						related: [
+							{ type: "specification" as const, value: specificationRef },
+							...(mutationClass ? [{ type: "mutation_class" as const, value: mutationClass }] : []),
+						],
 					},
 				],
 			})

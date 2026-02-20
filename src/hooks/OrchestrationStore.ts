@@ -32,7 +32,7 @@ export interface AgentTraceConversation {
 	}
 	ranges: AgentTraceRange[]
 	related: Array<{
-		type: "specification"
+		type: "specification" | "mutation_class"
 		value: string
 	}>
 }
@@ -114,10 +114,16 @@ const traceConversationSchema = z.object({
 	ranges: z.array(traceRangeSchema).min(1),
 	related: z
 		.array(
-			z.object({
-				type: z.literal("specification"),
-				value: z.string().min(1),
-			}),
+			z.union([
+				z.object({
+					type: z.literal("specification"),
+					value: z.string().min(1),
+				}),
+				z.object({
+					type: z.literal("mutation_class"),
+					value: z.enum(["AST_REFACTOR", "INTENT_EVOLUTION"]),
+				}),
+			]),
 		)
 		.min(1),
 })
