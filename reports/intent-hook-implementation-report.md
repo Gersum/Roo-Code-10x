@@ -350,4 +350,7 @@ end
 
 ---
 
-github link : https://github.com/Gersum/Roo-Code-10x.git
+github links
+
+Project Chemera impelementation using Roo: https://github.com/Gersum/TenX_Day2_Research.git
+Extended Extention repo : https://github.com/Gersum/Roo-Code-10x.git
