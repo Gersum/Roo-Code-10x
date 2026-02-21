@@ -327,6 +327,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 	private _activeIntentId: string | undefined
 	private _intentCheckoutStage: IntentCheckoutStage = "checkout_required"
 	private _pendingIntentHandshakeContext?: string
+	private readonly currentTurnReadHashes: Map<string, string> = new Map()
 	consecutiveNoToolUseCount: number = 0
 	consecutiveNoAssistantMessagesCount: number = 0
 	toolUsage: ToolUsage = {}
@@ -867,6 +868,32 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 			this.setActiveIntentId(intentId)
 		}
 		this._intentCheckoutStage = "execution_authorized"
+	}
+
+	public resetOptimisticLockForTurn(): void {
+		this.currentTurnReadHashes.clear()
+	}
+
+	public recordFileReadHash(relativePath: string, contentHash: string): void {
+		const normalizedPath = this.normalizeOptimisticLockPath(relativePath)
+		const normalizedHash = contentHash.trim()
+		if (!normalizedPath || !normalizedHash) {
+			return
+		}
+
+		this.currentTurnReadHashes.set(normalizedPath, normalizedHash)
+	}
+
+	public getReadHashForCurrentTurn(relativePath: string): string | undefined {
+		const normalizedPath = this.normalizeOptimisticLockPath(relativePath)
+		if (!normalizedPath) {
+			return undefined
+		}
+		return this.currentTurnReadHashes.get(normalizedPath)
+	}
+
+	private normalizeOptimisticLockPath(relativePath: string): string {
+		return relativePath.trim().replace(/\\/g, "/").replace(/^\.\//, "")
 	}
 
 	private containsExplicitUserTurnContent(content: Anthropic.Messages.ContentBlockParam[]): boolean {
@@ -2713,6 +2740,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 				((currentItem.retryAttempt ?? 0) === 0 && !isEmptyUserContent) || currentItem.userMessageWasRemoved
 			if (shouldAddUserMessage && this.containsExplicitUserTurnContent(currentUserContent)) {
 				this.resetIntentCheckoutForTurn()
+				this.resetOptimisticLockForTurn()
 			}
 			if (shouldAddUserMessage) {
 				await this.addToApiConversationHistory({ role: "user", content: finalUserContent })

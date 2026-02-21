@@ -38,6 +38,12 @@ interface ExtractedPaths {
 	outsideWorkspacePaths: string[]
 }
 
+interface StaleFileViolation {
+	relativePath: string
+	expectedHash: string
+	currentHash: string
+}
+
 export interface HookPreToolUseContext {
 	toolName: string
 	isMutatingTool: boolean
@@ -548,6 +554,34 @@ export class HookEngine {
 			}
 		}
 
+		const staleFileViolations = await this.detectStaleFileViolations(task, workspacePath, scopeCheckedPaths)
+		if (staleFileViolations.length > 0) {
+			const firstViolation = staleFileViolations[0]
+			await store.appendGovernanceEntry({
+				intent_id: intent.id,
+				tool_name: toolName,
+				status: "DENIED",
+				task_id: task.taskId,
+				model_identifier: task.api.getModel().id,
+				revision_id: await this.getGitRevision(task.cwd),
+				touched_paths: context.touchedPaths,
+				sidecar_constraints: context.sidecarConstraints,
+			})
+			return {
+				allowExecution: false,
+				context,
+				errorMessage: this.buildHookToolError(
+					"STALE_FILE",
+					`Stale File: ${firstViolation.relativePath} changed since it was read. Re-read before writing.`,
+					{
+						path: firstViolation.relativePath,
+						expected_hash: firstViolation.expectedHash,
+						current_hash: firstViolation.currentHash,
+					},
+				),
+			}
+		}
+
 		// Explicit context injection marker for traceability in intent history.
 		await store.appendRecentHistory(intent.id, `INTENT_CONTEXT_INJECTED ${toolName}`)
 
@@ -748,6 +782,53 @@ export class HookEngine {
 			const regex = globToRegExp(normalizedPattern)
 			return regex.test(normalizedPath)
 		})
+	}
+
+	private async detectStaleFileViolations(
+		task: Task,
+		workspacePath: string,
+		relativePaths: string[],
+	): Promise<StaleFileViolation[]> {
+		if (relativePaths.length === 0) {
+			return []
+		}
+
+		const taskWithReadHashes = task as Task & {
+			getReadHashForCurrentTurn?: (relativePath: string) => string | undefined
+		}
+		if (typeof taskWithReadHashes.getReadHashForCurrentTurn !== "function") {
+			return []
+		}
+
+		const violations: StaleFileViolation[] = []
+		for (const relativePath of toUnique(relativePaths)) {
+			const expectedHash = taskWithReadHashes.getReadHashForCurrentTurn(relativePath)
+			if (!expectedHash) {
+				continue
+			}
+
+			const absolutePath = path.join(workspacePath, relativePath)
+			let currentHash = "MISSING"
+			try {
+				const currentBuffer = await fs.readFile(absolutePath)
+				currentHash = sha256OfBuffer(currentBuffer)
+			} catch (error) {
+				const fsError = error as NodeJS.ErrnoException
+				if (fsError.code !== "ENOENT") {
+					throw error
+				}
+			}
+
+			if (currentHash !== expectedHash) {
+				violations.push({
+					relativePath,
+					expectedHash,
+					currentHash,
+				})
+			}
+		}
+
+		return violations
 	}
 
 	private extractToolPayloadForPath(block: ToolUse, relativePath: string): string | undefined {

@@ -6,6 +6,7 @@ import { describe, expect, it, vi } from "vitest"
 import { HookEngine } from "../HookEngine"
 import { Task } from "../../core/task/Task"
 import type { ToolUse } from "../../shared/tools"
+import { sha256OfString } from "../../utils/hash"
 
 function createMutatingToolBlock(): ToolUse {
 	return {
@@ -333,5 +334,50 @@ describe("HookEngine two-stage + HITL gating", () => {
 
 		expect(result.allowExecution).toBe(false)
 		expect(result.errorMessage).toContain('"code":"INTENT_IGNORED"')
+	})
+
+	it("blocks mutating writes when file hash is stale for the current turn", async () => {
+		const workspacePath = await fs.mkdtemp(path.join(os.tmpdir(), "roo-hook-stale-"))
+		const orchestrationDir = path.join(workspacePath, ".orchestration")
+		const sourceDir = path.join(workspacePath, "src")
+		await fs.mkdir(orchestrationDir, { recursive: true })
+		await fs.mkdir(sourceDir, { recursive: true })
+		await fs.writeFile(path.join(sourceDir, "a.ts"), "export const value = 2\n", "utf8")
+		await fs.writeFile(
+			path.join(orchestrationDir, "active_intents.yaml"),
+			[
+				"active_intents:",
+				"  - id: INT-10",
+				"    status: IN_PROGRESS",
+				'    owned_scope: ["src/**"]',
+				"    constraints: []",
+				"    acceptance_criteria: []",
+				"    recent_history: []",
+				"    related_files: []",
+				"",
+			].join("\n"),
+			"utf8",
+		)
+
+		const ask = vi.fn().mockResolvedValue({ response: "yesButtonClicked" })
+		const task = {
+			cwd: workspacePath,
+			workspacePath,
+			taskId: "task-10",
+			activeIntentId: "INT-10",
+			didToolFailInCurrentTurn: false,
+			api: { getModel: () => ({ id: "gpt-test" }) },
+			getIntentCheckoutStage: () => "execution_authorized",
+			getReadHashForCurrentTurn: () => sha256OfString("export const value = 1\n"),
+			ask,
+		} as unknown as Task
+
+		const engine = new HookEngine()
+		const result = await engine.preToolUse(task, createMutatingToolBlock())
+
+		expect(result.allowExecution).toBe(false)
+		expect(result.errorMessage).toContain('"code":"STALE_FILE"')
+		expect(result.errorMessage).toContain("Stale File: src/a.ts changed since it was read")
+		expect(ask).not.toHaveBeenCalled()
 	})
 })

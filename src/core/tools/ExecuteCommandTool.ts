@@ -28,6 +28,16 @@ interface ExecuteCommandParams {
 	cwd?: string
 }
 
+const LESSONS_LEARNED_HEADER = "## Lessons Learned"
+const LESSONS_SUMMARY_MAX_LENGTH = 240
+const VERIFICATION_COMMAND_PATTERNS: RegExp[] = [
+	/\b(test|tests|testing)\b/,
+	/\b(lint|eslint|ruff|flake8)\b/,
+	/\b(typecheck|type-check|mypy|pyright|tsc)\b/,
+	/\b(verify|validate|spec_check|check)\b/,
+	/\b(pytest|vitest|jest|mocha|ava|cargo test|go test)\b/,
+]
+
 export class ExecuteCommandTool extends BaseTool<"execute_command"> {
 	readonly name = "execute_command" as const
 
@@ -144,6 +154,100 @@ export type ExecuteCommandOptions = {
 	customCwd?: string
 	terminalShellIntegrationDisabled?: boolean
 	commandExecutionTimeout?: number
+}
+
+function isVerificationCommand(command: string): boolean {
+	const normalized = command.toLowerCase()
+	return VERIFICATION_COMMAND_PATTERNS.some((pattern) => pattern.test(normalized))
+}
+
+function didCommandFail(exitDetails: ExitCodeDetails | undefined): boolean {
+	if (!exitDetails) {
+		return false
+	}
+	if (exitDetails.signalName) {
+		return true
+	}
+	if (typeof exitDetails.exitCode === "number") {
+		return exitDetails.exitCode !== 0
+	}
+	return true
+}
+
+function summarizeFailureOutput(output: string | undefined): string {
+	const normalized = (output ?? "").replace(/\s+/g, " ").trim()
+	if (!normalized) {
+		return "No output captured."
+	}
+	if (normalized.length <= LESSONS_SUMMARY_MAX_LENGTH) {
+		return normalized
+	}
+	return `${normalized.slice(0, LESSONS_SUMMARY_MAX_LENGTH - 3)}...`
+}
+
+async function appendVerificationLesson(
+	task: Task,
+	command: string,
+	output: string | undefined,
+	status: string,
+): Promise<void> {
+	const claudePath = path.join(task.cwd, "CLAUDE.md")
+	const safeCommand = command.replace(/`/g, "\\`")
+	const safeSummary = summarizeFailureOutput(output).replace(/\n/g, " ").trim()
+	const entry = `- ${new Date().toISOString()} | command=\`${safeCommand}\` | status=${status} | summary=${safeSummary}\n`
+
+	try {
+		let existingContent = ""
+		try {
+			existingContent = await fs.readFile(claudePath, "utf8")
+		} catch (error) {
+			const fsError = error as NodeJS.ErrnoException
+			if (fsError.code !== "ENOENT") {
+				throw error
+			}
+		}
+
+		if (!existingContent) {
+			await fs.writeFile(claudePath, `# CLAUDE\n\n${LESSONS_LEARNED_HEADER}\n`, "utf8")
+		} else if (!existingContent.includes(LESSONS_LEARNED_HEADER)) {
+			const spacer = existingContent.endsWith("\n") ? "" : "\n"
+			await fs.appendFile(claudePath, `${spacer}\n${LESSONS_LEARNED_HEADER}\n`, "utf8")
+		}
+
+		await fs.appendFile(claudePath, entry, "utf8")
+	} catch (error) {
+		console.warn(
+			`[ExecuteCommandTool] Failed to append verification lesson to CLAUDE.md: ${error instanceof Error ? error.message : String(error)}`,
+		)
+	}
+}
+
+async function recordVerificationFailureLesson(
+	task: Task,
+	command: string,
+	output: string | undefined,
+	exitDetails: ExitCodeDetails | undefined,
+	options?: { timeoutSeconds?: number },
+): Promise<void> {
+	if (!isVerificationCommand(command)) {
+		return
+	}
+
+	if (typeof options?.timeoutSeconds === "number") {
+		await appendVerificationLesson(task, command, output, `timeout_${options.timeoutSeconds}s`)
+		return
+	}
+
+	if (!didCommandFail(exitDetails)) {
+		return
+	}
+
+	const status = exitDetails?.signalName
+		? `signal_${exitDetails.signalName}`
+		: typeof exitDetails?.exitCode === "number"
+			? `exit_${exitDetails.exitCode}`
+			: "exit_unknown"
+	await appendVerificationLesson(task, command, output, status)
 }
 
 export async function executeCommandInTerminal(
@@ -325,6 +429,9 @@ export async function executeCommandInTerminal(
 			await Promise.race([process, timeoutPromise])
 		} catch (error) {
 			if (isTimedOut) {
+				await recordVerificationFailureLesson(task, command, result, undefined, {
+					timeoutSeconds: commandExecutionTimeoutSeconds,
+				})
 				const status: CommandExecutionStatus = { executionId, status: "timeout" }
 				provider?.postMessageToWebview({ type: "commandExecutionStatus", text: JSON.stringify(status) })
 				await task.say("error", t("common:errors:command_timeout", { seconds: commandExecutionTimeoutSeconds }))
@@ -388,6 +495,8 @@ export async function executeCommandInTerminal(
 		]
 	} else if (completed || exitDetails) {
 		const currentWorkingDir = terminal.getCurrentWorkingDirectory().toPosix()
+		const lessonOutput = persistedResult?.preview ?? result
+		await recordVerificationFailureLesson(task, command, lessonOutput, exitDetails)
 
 		// Use persisted output format when output was truncated and spilled to disk
 		if (persistedResult?.truncated) {
