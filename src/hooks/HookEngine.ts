@@ -86,6 +86,11 @@ function toUnique(values: string[]): string[] {
 	return Array.from(new Set(values))
 }
 
+function isNumberedSpecIterationPath(relativePath: string): boolean {
+	const normalizedPath = relativePath.replace(/\\/g, "/").replace(/^\.\//, "")
+	return /^specs\/\d{3}-[^/]+(?:\/|$)/.test(normalizedPath)
+}
+
 export class HookEngine {
 	private buildIntentContextXml(intent: ActiveIntentRecord): string {
 		const scopeXml =
@@ -579,6 +584,53 @@ export class HookEngine {
 						current_hash: firstViolation.currentHash,
 					},
 				),
+			}
+		}
+
+		if (toolName === "write_to_file") {
+			const mutationClass = this.extractMutationClass(block)
+			const numberedSpecPaths = scopeCheckedPaths.filter(isNumberedSpecIterationPath)
+			if (numberedSpecPaths.length > 0 && mutationClass !== "INTENT_EVOLUTION") {
+				const createdSpecPaths: string[] = []
+				for (const relativePath of numberedSpecPaths) {
+					const absolutePath = path.join(workspacePath, relativePath)
+					try {
+						await fs.access(absolutePath)
+					} catch (error) {
+						const fsError = error as NodeJS.ErrnoException
+						if (fsError.code === "ENOENT") {
+							createdSpecPaths.push(relativePath)
+						} else {
+							throw error
+						}
+					}
+				}
+
+				if (createdSpecPaths.length > 0) {
+					await store.appendGovernanceEntry({
+						intent_id: intent.id,
+						tool_name: toolName,
+						status: "DENIED",
+						task_id: task.taskId,
+						model_identifier: task.api.getModel().id,
+						revision_id: await this.getGitRevision(task.cwd),
+						touched_paths: context.touchedPaths,
+						sidecar_constraints: context.sidecarConstraints,
+					})
+					return {
+						allowExecution: false,
+						context,
+						errorMessage: this.buildHookToolError(
+							"SPEC_ITERATION_REQUIRES_INTENT_EVOLUTION",
+							"Creating new specs/NNN-* files requires mutation_class INTENT_EVOLUTION.",
+							{
+								intent_id: intent.id,
+								paths: createdSpecPaths,
+								mutation_class: mutationClass ?? "MISSING",
+							},
+						),
+					}
+				}
 			}
 		}
 

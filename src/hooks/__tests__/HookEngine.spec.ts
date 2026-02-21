@@ -18,6 +18,27 @@ function createMutatingToolBlock(): ToolUse {
 	}
 }
 
+function createWriteToFileBlockForPath(
+	targetPath: string,
+	mutationClass?: "AST_REFACTOR" | "INTENT_EVOLUTION",
+): ToolUse {
+	return {
+		type: "tool_use",
+		name: "write_to_file",
+		params: {
+			path: targetPath,
+			content: "test\n",
+			...(mutationClass ? { mutation_class: mutationClass } : {}),
+		},
+		partial: false,
+		nativeArgs: {
+			path: targetPath,
+			content: "test\n",
+			...(mutationClass ? { mutation_class: mutationClass } : {}),
+		},
+	}
+}
+
 function createExecuteCommandBlock(command: string): ToolUse {
 	return {
 		type: "tool_use",
@@ -379,5 +400,90 @@ describe("HookEngine two-stage + HITL gating", () => {
 		expect(result.errorMessage).toContain('"code":"STALE_FILE"')
 		expect(result.errorMessage).toContain("Stale File: src/a.ts changed since it was read")
 		expect(ask).not.toHaveBeenCalled()
+	})
+
+	it("blocks creating new specs/NNN-* files without INTENT_EVOLUTION mutation class", async () => {
+		const workspacePath = await fs.mkdtemp(path.join(os.tmpdir(), "roo-hook-spec-guard-deny-"))
+		const orchestrationDir = path.join(workspacePath, ".orchestration")
+		await fs.mkdir(orchestrationDir, { recursive: true })
+		await fs.writeFile(
+			path.join(orchestrationDir, "active_intents.yaml"),
+			[
+				"active_intents:",
+				"  - id: INT-11",
+				"    status: IN_PROGRESS",
+				'    owned_scope: ["specs/**"]',
+				"    constraints: []",
+				"    acceptance_criteria: []",
+				"    recent_history: []",
+				"    related_files: []",
+				"",
+			].join("\n"),
+			"utf8",
+		)
+
+		const ask = vi.fn().mockResolvedValue({ response: "yesButtonClicked" })
+		const task = {
+			cwd: workspacePath,
+			workspacePath,
+			taskId: "task-11",
+			activeIntentId: "INT-11",
+			didToolFailInCurrentTurn: false,
+			api: { getModel: () => ({ id: "gpt-test" }) },
+			getIntentCheckoutStage: () => "execution_authorized",
+			ask,
+		} as unknown as Task
+
+		const engine = new HookEngine()
+		const result = await engine.preToolUse(
+			task,
+			createWriteToFileBlockForPath("specs/005-intent-test2/spec.md", "AST_REFACTOR"),
+		)
+
+		expect(result.allowExecution).toBe(false)
+		expect(result.errorMessage).toContain('"code":"SPEC_ITERATION_REQUIRES_INTENT_EVOLUTION"')
+		expect(ask).not.toHaveBeenCalled()
+	})
+
+	it("allows creating new specs/NNN-* files when mutation class is INTENT_EVOLUTION", async () => {
+		const workspacePath = await fs.mkdtemp(path.join(os.tmpdir(), "roo-hook-spec-guard-allow-"))
+		const orchestrationDir = path.join(workspacePath, ".orchestration")
+		await fs.mkdir(orchestrationDir, { recursive: true })
+		await fs.writeFile(
+			path.join(orchestrationDir, "active_intents.yaml"),
+			[
+				"active_intents:",
+				"  - id: INT-12",
+				"    status: IN_PROGRESS",
+				'    owned_scope: ["specs/**"]',
+				"    constraints: []",
+				"    acceptance_criteria: []",
+				"    recent_history: []",
+				"    related_files: []",
+				"",
+			].join("\n"),
+			"utf8",
+		)
+
+		const ask = vi.fn().mockResolvedValue({ response: "yesButtonClicked" })
+		const task = {
+			cwd: workspacePath,
+			workspacePath,
+			taskId: "task-12",
+			activeIntentId: "INT-12",
+			didToolFailInCurrentTurn: false,
+			api: { getModel: () => ({ id: "gpt-test" }) },
+			getIntentCheckoutStage: () => "execution_authorized",
+			ask,
+		} as unknown as Task
+
+		const engine = new HookEngine()
+		const result = await engine.preToolUse(
+			task,
+			createWriteToFileBlockForPath("specs/006-intent-test3/spec.md", "INTENT_EVOLUTION"),
+		)
+
+		expect(result.allowExecution).toBe(true)
+		expect(ask).toHaveBeenCalled()
 	})
 })
