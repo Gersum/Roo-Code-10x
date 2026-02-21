@@ -3,6 +3,7 @@ import fs from "fs/promises"
 import path from "path"
 import { execFile } from "child_process"
 import { promisify } from "util"
+import * as vscode from "vscode"
 
 import type { ToolName } from "@roo-code/types"
 
@@ -11,6 +12,7 @@ import { Task } from "../core/task/Task"
 import { type ActiveIntentRecord, type AgentTraceRecord, OrchestrationStore } from "./OrchestrationStore"
 import { IntentContextService } from "./IntentContextService"
 import { parseSourceCodeDefinitionsForFile } from "../services/tree-sitter"
+import { sha256OfBuffer, sha256OfString } from "../utils/hash"
 
 const execFileAsync = promisify(execFile)
 
@@ -26,15 +28,26 @@ const MUTATING_TOOLS = new Set<ToolName>([
 ])
 
 const APPLY_PATCH_FILE_MARKERS = ["*** Add File: ", "*** Delete File: ", "*** Update File: ", "*** Move to: "] as const
+const INTENT_IGNORE_FEEDBACK_LIMIT = 3
+
+type CommandClassification = "safe" | "destructive"
+type MutationClass = "AST_REFACTOR" | "INTENT_EVOLUTION"
 
 interface ExtractedPaths {
 	insideWorkspacePaths: string[]
 	outsideWorkspacePaths: string[]
 }
 
+interface StaleFileViolation {
+	relativePath: string
+	expectedHash: string
+	currentHash: string
+}
+
 export interface HookPreToolUseContext {
 	toolName: string
 	isMutatingTool: boolean
+	commandClassification: CommandClassification
 	intentId?: string
 	intent?: ActiveIntentRecord
 	touchedPaths: string[]
@@ -73,10 +86,142 @@ function toUnique(values: string[]): string[] {
 	return Array.from(new Set(values))
 }
 
+function isNumberedSpecIterationPath(relativePath: string): boolean {
+	const normalizedPath = relativePath.replace(/\\/g, "/").replace(/^\.\//, "")
+	return /^specs\/\d{3}-[^/]+(?:\/|$)/.test(normalizedPath)
+}
+
 export class HookEngine {
+	private buildIntentContextXml(intent: ActiveIntentRecord): string {
+		const scopeXml =
+			intent.owned_scope.length > 0
+				? intent.owned_scope.map((pathGlob) => `    <path>${pathGlob}</path>`).join("\n")
+				: "    <path>(none)</path>"
+		const constraintsXml =
+			intent.constraints.length > 0
+				? intent.constraints.map((constraint) => `    <constraint>${constraint}</constraint>`).join("\n")
+				: "    <constraint>(none)</constraint>"
+
+		return [
+			`<intent_context id="${intent.id}">`,
+			"  <owned_scope>",
+			scopeXml,
+			"  </owned_scope>",
+			"  <constraints>",
+			constraintsXml,
+			"  </constraints>",
+			"</intent_context>",
+		].join("\n")
+	}
+
+	private classifyExecuteCommand(block: ToolUse): CommandClassification {
+		if (block.name !== "execute_command") {
+			return "safe"
+		}
+		const nativeArgs = (block.nativeArgs as Record<string, unknown> | undefined) ?? {}
+		const command = normalizePathLike(nativeArgs.command ?? block.params.command)?.toLowerCase()
+		if (!command) {
+			return "destructive"
+		}
+
+		const destructivePatterns = [
+			/\brm\b/,
+			/\bmv\b/,
+			/\bcp\b/,
+			/\bchmod\b/,
+			/\bchown\b/,
+			/\bmkdir\b/,
+			/\brmdir\b/,
+			/\bsed\s+-i\b/,
+			/\btee\b/,
+			/\bgit\s+(add|commit|merge|rebase|reset|clean|checkout)\b/,
+			/\bnpm\s+(publish|version)\b/,
+			/\bpnpm\s+(publish|version)\b/,
+			/\byarn\s+(publish|version)\b/,
+			/\bpython\b.*\b(open|write|remove|unlink)\b/,
+			/\bnode\b/,
+			/>/,
+		]
+		const safeAllowPatterns = [
+			/^\s*(ls|cat|pwd|echo|whoami|date|rg|find|git\s+status|git\s+log|git\s+show|git\s+rev-parse)\b/,
+		]
+		if (safeAllowPatterns.some((pattern) => pattern.test(command))) {
+			return "safe"
+		}
+		return destructivePatterns.some((pattern) => pattern.test(command)) ? "destructive" : "safe"
+	}
+
+	private buildHookToolError(code: string, message: string, details?: Record<string, unknown>): string {
+		return JSON.stringify(
+			{
+				error: {
+					type: "HOOK_PRE_TOOL_DENIED",
+					code,
+					message,
+					...(details ? { details } : {}),
+				},
+			},
+			null,
+			0,
+		)
+	}
+
+	private intentMatchesIgnorePattern(intentId: string, pattern: string): boolean {
+		if (!pattern.trim()) {
+			return false
+		}
+		const regex = globToRegExp(pattern.trim())
+		return regex.test(intentId)
+	}
+
+	private async requestHitlAuthorization(
+		task: Task,
+		toolName: string,
+		intentId: string,
+		paths: string[],
+	): Promise<{ approved: boolean; feedback?: string }> {
+		const warningMessage = `Approve ${toolName} for intent ${intentId}?`
+		const detail = paths.length > 0 ? `Paths: ${paths.join(", ")}` : "No explicit path targets detected."
+		try {
+			const decision = await vscode.window.showWarningMessage(
+				warningMessage,
+				{ modal: true, detail },
+				"Approve",
+				"Reject",
+			)
+			if (decision === "Reject") {
+				return { approved: false, feedback: "Rejected from VS Code warning gate." }
+			}
+			if (decision === "Approve") {
+				return { approved: true }
+			}
+		} catch {
+			// Fall through to task.ask gate below.
+		}
+
+		if (typeof (task as Task & { ask?: unknown }).ask === "function") {
+			const hitlPayload = JSON.stringify({
+				tool: "preToolAuthorization",
+				requested_tool: toolName,
+				intent_id: intentId,
+				paths,
+			})
+			const { response, text } = await task.ask("tool", hitlPayload)
+			if (response === "yesButtonClicked") {
+				return { approved: true }
+			}
+			return { approved: false, feedback: typeof text === "string" ? text : undefined }
+		}
+
+		return { approved: true }
+	}
+
 	async preToolUse(task: Task, block: ToolUse): Promise<HookPreToolUseResult> {
 		const toolName = String(block.name)
-		const isMutatingTool = MUTATING_TOOLS.has(block.name as ToolName)
+		const commandClassification = this.classifyExecuteCommand(block)
+		const isMutatingTool =
+			MUTATING_TOOLS.has(block.name as ToolName) ||
+			(block.name === "execute_command" && commandClassification === "destructive")
 		const workspacePath = this.getWorkspacePath(task)
 		if (!workspacePath) {
 			return {
@@ -84,6 +229,7 @@ export class HookEngine {
 				context: {
 					toolName,
 					isMutatingTool,
+					commandClassification,
 					touchedPaths: [],
 					sidecarConstraints: [],
 					sidecarVersion: 1,
@@ -101,6 +247,7 @@ export class HookEngine {
 		const context: HookPreToolUseContext = {
 			toolName,
 			isMutatingTool,
+			commandClassification,
 			touchedPaths: extractedPaths.insideWorkspacePaths,
 			sidecarConstraints: sidecar.architectural_constraints,
 			sidecarVersion: sidecar.version,
@@ -113,18 +260,16 @@ export class HookEngine {
 				const intentContextService = new IntentContextService(store)
 				const selectedIntent = await intentContextService.selectIntent(requestedIntentId)
 				if (selectedIntent.found && selectedIntent.context) {
-					const sidecarConstraintLines =
-						sidecar.architectural_constraints.length > 0
-							? sidecar.architectural_constraints.map((constraint) => `- ${constraint}`).join("\n")
-							: "- (none)"
-					const handshakeContext = [
-						"Intent reasoning intercept completed.",
-						"",
-						selectedIntent.message,
-						"",
-						"Sidecar architectural constraints:",
-						sidecarConstraintLines,
-					].join("\n")
+					const handshakeContext = this.buildIntentContextXml({
+						id: selectedIntent.context.id,
+						name: selectedIntent.context.name,
+						status: selectedIntent.context.status,
+						owned_scope: selectedIntent.context.owned_scope,
+						constraints: selectedIntent.context.constraints,
+						acceptance_criteria: selectedIntent.context.acceptance_criteria,
+						recent_history: selectedIntent.context.recent_history,
+						related_files: selectedIntent.context.related_files,
+					})
 					task.setPendingIntentHandshakeContext(handshakeContext)
 				}
 				await intentContextService.markIntentInProgress(requestedIntentId)
@@ -137,6 +282,20 @@ export class HookEngine {
 			return { allowExecution: true, context }
 		}
 
+		const activeIntentsRelativePath = path.posix.join(
+			OrchestrationStore.ORCHESTRATION_DIR,
+			OrchestrationStore.ACTIVE_INTENTS_FILE,
+		)
+		const touchesOnlyActiveIntentsFile =
+			extractedPaths.insideWorkspacePaths.length > 0 &&
+			extractedPaths.outsideWorkspacePaths.length === 0 &&
+			extractedPaths.insideWorkspacePaths.every((relativePath) => relativePath === activeIntentsRelativePath)
+		let isActiveIntentBootstrapMutation = false
+		if (touchesOnlyActiveIntentsFile) {
+			const intents = await store.loadIntents()
+			isActiveIntentBootstrapMutation = intents.length === 0
+		}
+
 		// Two-stage turn state machine:
 		// stage 1: checkout_required (must call select_active_intent first)
 		// stage 2: execution_authorized (mutating tools allowed)
@@ -147,7 +306,7 @@ export class HookEngine {
 			typeof (task as Task & { getIntentCheckoutStage?: () => string }).getIntentCheckoutStage === "function"
 				? (task as Task & { getIntentCheckoutStage: () => string }).getIntentCheckoutStage()
 				: "execution_authorized"
-		if (stage !== "execution_authorized") {
+		if (stage !== "execution_authorized" && !isActiveIntentBootstrapMutation) {
 			await store.appendGovernanceEntry({
 				intent_id: task.activeIntentId,
 				tool_name: toolName,
@@ -223,7 +382,10 @@ export class HookEngine {
 			const deniedBySidecar = extractedPaths.insideWorkspacePaths.filter((relativePath) =>
 				sidecar.deny_mutations.some((rule) => this.pathMatchesOwnedScope(relativePath, [rule.path_glob])),
 			)
-			if (deniedBySidecar.length > 0) {
+			const deniedBySidecarAfterControlPlaneException = deniedBySidecar.filter(
+				(relativePath) => relativePath !== activeIntentsRelativePath,
+			)
+			if (deniedBySidecarAfterControlPlaneException.length > 0) {
 				await store.appendGovernanceEntry({
 					intent_id: task.activeIntentId,
 					tool_name: toolName,
@@ -239,7 +401,7 @@ export class HookEngine {
 					context,
 					errorMessage:
 						`PreToolUse denied ${toolName}: sidecar policy v${sidecar.version} denies mutation for path(s): ` +
-						`${deniedBySidecar.join(", ")}.`,
+						`${deniedBySidecarAfterControlPlaneException.join(", ")}.`,
 				}
 			}
 		}
@@ -264,6 +426,37 @@ export class HookEngine {
 			}
 		}
 
+		if (isActiveIntentBootstrapMutation) {
+			// Bootstrap path: permit the first active_intents.yaml mutation so teams can initialize
+			// intent governance from an empty state without disabling hooks.
+			const hitl = await this.requestHitlAuthorization(task, toolName, "INTENT-BOOTSTRAP", context.touchedPaths)
+			if (!hitl.approved) {
+				await store.appendGovernanceEntry({
+					tool_name: toolName,
+					status: "DENIED",
+					task_id: task.taskId,
+					model_identifier: task.api.getModel().id,
+					revision_id: await this.getGitRevision(task.cwd),
+					touched_paths: context.touchedPaths,
+					sidecar_constraints: context.sidecarConstraints,
+				})
+				return {
+					allowExecution: false,
+					context,
+					errorMessage: this.buildHookToolError("HITL_REJECTED", "Mutation rejected by authorization gate.", {
+						tool_name: toolName,
+						intent_id: "INTENT-BOOTSTRAP",
+						feedback: hitl.feedback,
+					}),
+				}
+			}
+
+			await store.appendSharedBrainEntry(
+				"Bootstrap mutation approved for .orchestration/active_intents.yaml with no existing intents.",
+			)
+			return { allowExecution: true, context }
+		}
+
 		const activeIntentId = task.activeIntentId?.trim()
 		if (!activeIntentId) {
 			await store.appendGovernanceEntry({
@@ -278,7 +471,7 @@ export class HookEngine {
 			return {
 				allowExecution: false,
 				context,
-				errorMessage: `PreToolUse denied ${toolName}: no active intent selected. Call select_active_intent before mutating code.`,
+				errorMessage: "You must cite a valid active Intent ID.",
 			}
 		}
 
@@ -297,15 +490,47 @@ export class HookEngine {
 			return {
 				allowExecution: false,
 				context,
-				errorMessage: `PreToolUse denied ${toolName}: active intent '${activeIntentId}' not found in .orchestration/active_intents.yaml.`,
+				errorMessage: "You must cite a valid active Intent ID.",
 			}
 		}
 
 		context.intentId = intent.id
 		context.intent = intent
 
-		if (intent.owned_scope.length > 0 && extractedPaths.insideWorkspacePaths.length > 0) {
-			const disallowedPaths = extractedPaths.insideWorkspacePaths.filter(
+		const ignoredIntentPatterns = await store.loadIntentIgnorePatterns()
+		const matchedIgnoredPatterns = ignoredIntentPatterns.filter((pattern) =>
+			this.intentMatchesIgnorePattern(intent.id, pattern),
+		)
+		if (matchedIgnoredPatterns.length > 0) {
+			await store.appendGovernanceEntry({
+				intent_id: intent.id,
+				tool_name: toolName,
+				status: "DENIED",
+				task_id: task.taskId,
+				model_identifier: task.api.getModel().id,
+				revision_id: await this.getGitRevision(task.cwd),
+				touched_paths: context.touchedPaths,
+				sidecar_constraints: context.sidecarConstraints,
+			})
+			return {
+				allowExecution: false,
+				context,
+				errorMessage: this.buildHookToolError(
+					"INTENT_IGNORED",
+					`Intent ${intent.id} is excluded by .intentignore and cannot mutate code in this session.`,
+					{
+						intent_id: intent.id,
+						matched_patterns: matchedIgnoredPatterns.slice(0, INTENT_IGNORE_FEEDBACK_LIMIT),
+					},
+				),
+			}
+		}
+
+		const scopeCheckedPaths = extractedPaths.insideWorkspacePaths.filter(
+			(relativePath) => relativePath !== activeIntentsRelativePath,
+		)
+		if (intent.owned_scope.length > 0 && scopeCheckedPaths.length > 0) {
+			const disallowedPaths = scopeCheckedPaths.filter(
 				(filePath) => !this.pathMatchesOwnedScope(filePath, intent.owned_scope),
 			)
 
@@ -327,8 +552,84 @@ export class HookEngine {
 					allowExecution: false,
 					context,
 					errorMessage:
-						`PreToolUse denied ${toolName}: path(s) outside owned_scope for intent ${intent.id}. ` +
-						`Disallowed: ${disallowedPaths.join(", ")}`,
+						toolName === "write_to_file"
+							? `Scope Violation: ${this.resolveSpecificationReference(intent.id, intent)} is not authorized to edit ${disallowedPaths[0]}. Request scope expansion.`
+							: `PreToolUse denied ${toolName}: path(s) outside owned_scope for intent ${intent.id}. Disallowed: ${disallowedPaths.join(", ")}`,
+				}
+			}
+		}
+
+		const staleFileViolations = await this.detectStaleFileViolations(task, workspacePath, scopeCheckedPaths)
+		if (staleFileViolations.length > 0) {
+			const firstViolation = staleFileViolations[0]
+			await store.appendGovernanceEntry({
+				intent_id: intent.id,
+				tool_name: toolName,
+				status: "DENIED",
+				task_id: task.taskId,
+				model_identifier: task.api.getModel().id,
+				revision_id: await this.getGitRevision(task.cwd),
+				touched_paths: context.touchedPaths,
+				sidecar_constraints: context.sidecarConstraints,
+			})
+			return {
+				allowExecution: false,
+				context,
+				errorMessage: this.buildHookToolError(
+					"STALE_FILE",
+					`Stale File: ${firstViolation.relativePath} changed since it was read. Re-read before writing.`,
+					{
+						path: firstViolation.relativePath,
+						expected_hash: firstViolation.expectedHash,
+						current_hash: firstViolation.currentHash,
+					},
+				),
+			}
+		}
+
+		if (toolName === "write_to_file") {
+			const mutationClass = this.extractMutationClass(block)
+			const numberedSpecPaths = scopeCheckedPaths.filter(isNumberedSpecIterationPath)
+			if (numberedSpecPaths.length > 0 && mutationClass !== "INTENT_EVOLUTION") {
+				const createdSpecPaths: string[] = []
+				for (const relativePath of numberedSpecPaths) {
+					const absolutePath = path.join(workspacePath, relativePath)
+					try {
+						await fs.access(absolutePath)
+					} catch (error) {
+						const fsError = error as NodeJS.ErrnoException
+						if (fsError.code === "ENOENT") {
+							createdSpecPaths.push(relativePath)
+						} else {
+							throw error
+						}
+					}
+				}
+
+				if (createdSpecPaths.length > 0) {
+					await store.appendGovernanceEntry({
+						intent_id: intent.id,
+						tool_name: toolName,
+						status: "DENIED",
+						task_id: task.taskId,
+						model_identifier: task.api.getModel().id,
+						revision_id: await this.getGitRevision(task.cwd),
+						touched_paths: context.touchedPaths,
+						sidecar_constraints: context.sidecarConstraints,
+					})
+					return {
+						allowExecution: false,
+						context,
+						errorMessage: this.buildHookToolError(
+							"SPEC_ITERATION_REQUIRES_INTENT_EVOLUTION",
+							"Creating new specs/NNN-* files requires mutation_class INTENT_EVOLUTION.",
+							{
+								intent_id: intent.id,
+								paths: createdSpecPaths,
+								mutation_class: mutationClass ?? "MISSING",
+							},
+						),
+					}
 				}
 			}
 		}
@@ -338,31 +639,26 @@ export class HookEngine {
 
 		// Human-in-the-loop authorization gate in pre-hook for mutating tools.
 		// For production Task instances, we require explicit approval before tool execution.
-		if (typeof (task as Task & { ask?: unknown }).ask === "function") {
-			const hitlPayload = JSON.stringify({
-				tool: "preToolAuthorization",
-				requested_tool: toolName,
+		const hitl = await this.requestHitlAuthorization(task, toolName, intent.id, context.touchedPaths)
+		if (!hitl.approved) {
+			await store.appendGovernanceEntry({
 				intent_id: intent.id,
-				paths: context.touchedPaths,
+				tool_name: toolName,
+				status: "DENIED",
+				task_id: task.taskId,
+				model_identifier: task.api.getModel().id,
+				revision_id: await this.getGitRevision(task.cwd),
+				touched_paths: context.touchedPaths,
+				sidecar_constraints: context.sidecarConstraints,
 			})
-			const { response, text } = await task.ask("tool", hitlPayload)
-			if (response !== "yesButtonClicked") {
-				const feedback = typeof text === "string" && text.trim().length > 0 ? ` Feedback: ${text}` : ""
-				await store.appendGovernanceEntry({
-					intent_id: intent.id,
+			return {
+				allowExecution: false,
+				context,
+				errorMessage: this.buildHookToolError("HITL_REJECTED", "Mutation rejected by authorization gate.", {
 					tool_name: toolName,
-					status: "DENIED",
-					task_id: task.taskId,
-					model_identifier: task.api.getModel().id,
-					revision_id: await this.getGitRevision(task.cwd),
-					touched_paths: context.touchedPaths,
-					sidecar_constraints: context.sidecarConstraints,
-				})
-				return {
-					allowExecution: false,
-					context,
-					errorMessage: `PreToolUse denied ${toolName}: HITL authorization was not approved.${feedback}`,
-				}
+					intent_id: intent.id,
+					feedback: hitl.feedback,
+				}),
 			}
 		}
 
@@ -540,6 +836,53 @@ export class HookEngine {
 		})
 	}
 
+	private async detectStaleFileViolations(
+		task: Task,
+		workspacePath: string,
+		relativePaths: string[],
+	): Promise<StaleFileViolation[]> {
+		if (relativePaths.length === 0) {
+			return []
+		}
+
+		const taskWithReadHashes = task as Task & {
+			getReadHashForCurrentTurn?: (relativePath: string) => string | undefined
+		}
+		if (typeof taskWithReadHashes.getReadHashForCurrentTurn !== "function") {
+			return []
+		}
+
+		const violations: StaleFileViolation[] = []
+		for (const relativePath of toUnique(relativePaths)) {
+			const expectedHash = taskWithReadHashes.getReadHashForCurrentTurn(relativePath)
+			if (!expectedHash) {
+				continue
+			}
+
+			const absolutePath = path.join(workspacePath, relativePath)
+			let currentHash = "MISSING"
+			try {
+				const currentBuffer = await fs.readFile(absolutePath)
+				currentHash = sha256OfBuffer(currentBuffer)
+			} catch (error) {
+				const fsError = error as NodeJS.ErrnoException
+				if (fsError.code !== "ENOENT") {
+					throw error
+				}
+			}
+
+			if (currentHash !== expectedHash) {
+				violations.push({
+					relativePath,
+					expectedHash,
+					currentHash,
+				})
+			}
+		}
+
+		return violations
+	}
+
 	private extractToolPayloadForPath(block: ToolUse, relativePath: string): string | undefined {
 		const nativeArgs = (block.nativeArgs as Record<string, unknown> | undefined) ?? {}
 		const params = block.params
@@ -578,6 +921,18 @@ export class HookEngine {
 		}
 	}
 
+	private extractMutationClass(block?: ToolUse): MutationClass | undefined {
+		if (!block || block.name !== "write_to_file") {
+			return undefined
+		}
+		const nativeArgs = (block.nativeArgs as Record<string, unknown> | undefined) ?? {}
+		const raw = normalizePathLike(nativeArgs.mutation_class ?? block.params.mutation_class)
+		if (raw === "AST_REFACTOR" || raw === "INTENT_EVOLUTION") {
+			return raw
+		}
+		return undefined
+	}
+
 	private resolveSpecificationReference(intentId: string, intent?: ActiveIntentRecord): string {
 		const candidateKeys = ["specification_id", "requirement_id", "req_id", "spec_id"] as const
 		for (const key of candidateKeys) {
@@ -606,27 +961,26 @@ export class HookEngine {
 				fileBuffer = Buffer.alloc(0)
 			}
 
-			const contentHash = `sha256:${crypto.createHash("sha256").update(fileBuffer).digest("hex")}`
+			const contentHash = sha256OfBuffer(fileBuffer)
 			const text = fileBuffer.toString("utf8")
 			const lineCount = text.length === 0 ? 0 : text.split(/\r?\n/).length
 			const payloadText = block ? this.extractToolPayloadForPath(block, relativePath) : undefined
 			const payloadLineCount = payloadText ? payloadText.split(/\r?\n/).length : 0
 			const rangeStart = payloadText ? 1 : lineCount > 0 ? 1 : 0
 			const rangeEnd = payloadText ? payloadLineCount : lineCount
-			const rangeHash = payloadText
-				? `sha256:${crypto.createHash("sha256").update(payloadText).digest("hex")}`
-				: contentHash
+			const rangeHash = payloadText ? sha256OfString(payloadText) : contentHash
 			let astSummaryHash: string | undefined
 			try {
 				const astSummary = await parseSourceCodeDefinitionsForFile(absolutePath)
 				if (astSummary && astSummary.trim().length > 0) {
-					astSummaryHash = `sha256:${crypto.createHash("sha256").update(astSummary).digest("hex")}`
+					astSummaryHash = sha256OfString(astSummary)
 				}
 			} catch {
 				// Best-effort AST extraction for trace linkage.
 			}
 
 			const specificationRef = this.resolveSpecificationReference(context.intentId!, context.intent)
+			const mutationClass = this.extractMutationClass(block)
 			files.push({
 				relative_path: relativePath,
 				...(astSummaryHash
@@ -651,7 +1005,10 @@ export class HookEngine {
 								content_hash: rangeHash,
 							},
 						],
-						related: [{ type: "specification" as const, value: specificationRef }],
+						related: [
+							{ type: "specification" as const, value: specificationRef },
+							...(mutationClass ? [{ type: "mutation_class" as const, value: mutationClass }] : []),
+						],
 					},
 				],
 			})

@@ -21,6 +21,8 @@ import { BaseTool, ToolCallbacks } from "./BaseTool"
 interface WriteToFileParams {
 	path: string
 	content: string
+	intent_id: string
+	mutation_class: "AST_REFACTOR" | "INTENT_EVOLUTION"
 }
 
 export class WriteToFileTool extends BaseTool<"write_to_file"> {
@@ -30,6 +32,8 @@ export class WriteToFileTool extends BaseTool<"write_to_file"> {
 		const { pushToolResult, handleError, askApproval } = callbacks
 		const relPath = params.path
 		let newContent = params.content
+		const intentId = params.intent_id
+		const mutationClass = params.mutation_class
 
 		if (!relPath) {
 			task.consecutiveMistakeCount++
@@ -43,6 +47,22 @@ export class WriteToFileTool extends BaseTool<"write_to_file"> {
 			task.consecutiveMistakeCount++
 			task.recordToolError("write_to_file")
 			pushToolResult(await task.sayAndCreateMissingParamError("write_to_file", "content"))
+			await task.diffViewProvider.reset()
+			return
+		}
+
+		if (!intentId) {
+			task.consecutiveMistakeCount++
+			task.recordToolError("write_to_file")
+			pushToolResult(await task.sayAndCreateMissingParamError("write_to_file", "intent_id"))
+			await task.diffViewProvider.reset()
+			return
+		}
+
+		if (!mutationClass) {
+			task.consecutiveMistakeCount++
+			task.recordToolError("write_to_file")
+			pushToolResult(await task.sayAndCreateMissingParamError("write_to_file", "mutation_class"))
 			await task.diffViewProvider.reset()
 			return
 		}

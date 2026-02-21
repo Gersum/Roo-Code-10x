@@ -132,6 +132,7 @@ import { AutoApprovalHandler, checkAutoApproval } from "../auto-approval"
 import { MessageManager } from "../message-manager"
 import { validateAndFixToolResultIds } from "./validateToolResultIds"
 import { mergeConsecutiveApiMessages } from "./mergeConsecutiveApiMessages"
+import { OrchestrationStore, type ActiveIntentRecord } from "../../hooks/OrchestrationStore"
 
 const MAX_EXPONENTIAL_BACKOFF_SECONDS = 600 // 10 minutes
 const DEFAULT_USAGE_COLLECTION_TIMEOUT_MS = 5000 // 5 seconds
@@ -326,6 +327,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 	private _activeIntentId: string | undefined
 	private _intentCheckoutStage: IntentCheckoutStage = "checkout_required"
 	private _pendingIntentHandshakeContext?: string
+	private readonly currentTurnReadHashes: Map<string, string> = new Map()
 	consecutiveNoToolUseCount: number = 0
 	consecutiveNoAssistantMessagesCount: number = 0
 	toolUsage: ToolUsage = {}
@@ -866,6 +868,41 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 			this.setActiveIntentId(intentId)
 		}
 		this._intentCheckoutStage = "execution_authorized"
+	}
+
+	public resetOptimisticLockForTurn(): void {
+		this.currentTurnReadHashes.clear()
+	}
+
+	public recordFileReadHash(relativePath: string, contentHash: string): void {
+		const normalizedPath = this.normalizeOptimisticLockPath(relativePath)
+		const normalizedHash = contentHash.trim()
+		if (!normalizedPath || !normalizedHash) {
+			return
+		}
+
+		this.currentTurnReadHashes.set(normalizedPath, normalizedHash)
+	}
+
+	public getReadHashForCurrentTurn(relativePath: string): string | undefined {
+		const normalizedPath = this.normalizeOptimisticLockPath(relativePath)
+		if (!normalizedPath) {
+			return undefined
+		}
+		return this.currentTurnReadHashes.get(normalizedPath)
+	}
+
+	private normalizeOptimisticLockPath(relativePath: string): string {
+		return relativePath.trim().replace(/\\/g, "/").replace(/^\.\//, "")
+	}
+
+	private containsExplicitUserTurnContent(content: Anthropic.Messages.ContentBlockParam[]): boolean {
+		return content.some((block) => {
+			if (block.type !== "text" || typeof block.text !== "string") {
+				return false
+			}
+			return block.text.includes("<user_message>")
+		})
 	}
 
 	public setPendingIntentHandshakeContext(context: string | undefined): void {
@@ -2701,6 +2738,10 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 			const isEmptyUserContent = currentUserContent.length === 0
 			const shouldAddUserMessage =
 				((currentItem.retryAttempt ?? 0) === 0 && !isEmptyUserContent) || currentItem.userMessageWasRemoved
+			if (shouldAddUserMessage && this.containsExplicitUserTurnContent(currentUserContent)) {
+				this.resetIntentCheckoutForTurn()
+				this.resetOptimisticLockForTurn()
+			}
 			if (shouldAddUserMessage) {
 				await this.addToApiConversationHistory({ role: "user", content: finalUserContent })
 				TelemetryService.instance.captureConversationMessage(this.taskId, "user")
@@ -2811,7 +2852,6 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 				this.didRejectTool = false
 				this.didAlreadyUseTool = false
 				this.assistantMessageSavedToHistory = false
-				this.resetIntentCheckoutForTurn()
 				// Reset tool failure flag for each new assistant turn - this ensures that tool failures
 				// only prevent attempt_completion within the same assistant message, not across turns
 				// (e.g., if a tool fails, then user sends a message saying "just complete anyway")
@@ -3825,6 +3865,8 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 			apiConfiguration,
 			enableSubfolderRules,
 		} = state ?? {}
+		const injectedIntentContext = await this.buildIntentContextInjectionForPrompt()
+		const mergedCustomInstructions = [customInstructions, injectedIntentContext].filter(Boolean).join("\n\n")
 
 		return await (async () => {
 			const provider = this.providerRef.deref()
@@ -3844,7 +3886,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 				mode ?? defaultModeSlug,
 				customModePrompts,
 				customModes,
-				customInstructions,
+				mergedCustomInstructions,
 				experiments,
 				language,
 				rooIgnoreInstructions,
@@ -3863,6 +3905,85 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 				provider.getSkillsManager(),
 			)
 		})()
+	}
+
+	private resolveSpecificationIdsForIntent(intent: ActiveIntentRecord): string[] {
+		const ids = new Set<string>()
+		ids.add(intent.id)
+
+		for (const key of ["specification_id", "requirement_id", "req_id", "spec_id"] as const) {
+			const value = intent[key]
+			if (typeof value === "string" && value.trim().length > 0) {
+				ids.add(value.trim())
+			}
+		}
+
+		return Array.from(ids)
+	}
+
+	private buildIntentContextXml(intent: ActiveIntentRecord): string {
+		const scopeXml =
+			intent.owned_scope.length > 0
+				? intent.owned_scope.map((scope) => `    <path>${scope}</path>`).join("\n")
+				: "    <path>(none)</path>"
+		const constraintsXml =
+			intent.constraints.length > 0
+				? intent.constraints.map((constraint) => `    <constraint>${constraint}</constraint>`).join("\n")
+				: "    <constraint>(none)</constraint>"
+
+		return [
+			`<intent_context id="${intent.id}">`,
+			"  <owned_scope>",
+			scopeXml,
+			"  </owned_scope>",
+			"  <constraints>",
+			constraintsXml,
+			"  </constraints>",
+			"</intent_context>",
+		].join("\n")
+	}
+
+	private async buildIntentContextInjectionForPrompt(): Promise<string | undefined> {
+		const workspacePath = this.workspacePath || this.cwd
+		if (!workspacePath) {
+			return undefined
+		}
+
+		try {
+			const store = new OrchestrationStore(workspacePath)
+			await store.ensureInitialized()
+			const intents = await store.loadIntents()
+			const activeIntent =
+				(this.activeIntentId ? intents.find((intent) => intent.id === this.activeIntentId) : undefined) ??
+				intents.find((intent) => intent.status === "IN_PROGRESS")
+			if (!activeIntent) {
+				return undefined
+			}
+
+			const specificationIds = this.resolveSpecificationIdsForIntent(activeIntent)
+			const relatedTraceRefs = await store.loadRecentTraceReferencesForSpecifications(specificationIds, 10)
+			const relatedTraceXml =
+				relatedTraceRefs.length > 0
+					? relatedTraceRefs
+							.map(
+								(ref) =>
+									`    <trace path="${ref.relative_path}" hash="${ref.content_hash}" spec="${ref.specification_value}" ts="${ref.timestamp}" />`,
+							)
+							.join("\n")
+					: "    <trace>(none)</trace>"
+
+			return [
+				"<intent_loader_context>",
+				this.buildIntentContextXml(activeIntent),
+				"  <related_trace>",
+				relatedTraceXml,
+				"  </related_trace>",
+				"</intent_loader_context>",
+			].join("\n")
+		} catch (error) {
+			console.error("Failed to build intent loader context for system prompt:", error)
+			return undefined
+		}
 	}
 
 	private getCurrentProfileId(state: any): string {

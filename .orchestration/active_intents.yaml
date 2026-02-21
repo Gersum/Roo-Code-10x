@@ -1,14 +1,218 @@
 active_intents:
-  - id: "auth-refactor"
-    name: "Refactor auth flow"
-    status: "IN_PROGRESS"
+  - id: INT-001
+    name: Swarm Orchestration Core (Planner Worker Judge)
+    status: IN_PROGRESS
     owned_scope:
-      - "src/hooks/**"
-      - "src/integrations/openai-codex/**"
+      - src/orchestrator/**
+      - src/planner/**
+      - src/worker/**
+      - src/judge/**
+      - tests/swarm/**
     constraints:
-      - "Keep public API unchanged"
+      - Task flow must follow Goal -> Plan -> Queue -> Execute -> Review -> Approve|Reject|Escalate.
+      - Worker execution must remain shared-nothing to avoid cascading failures.
+      - Failed tasks retry once; escalation follows second failure.
     acceptance_criteria:
-      - "No regressions in auth flow"
-    related_files:
-      - "src/hooks/HookEngine.ts"
+      - End-to-end swarm loop tests pass with deterministic state transitions.
+      - Escalation paths trigger correctly after retry exhaustion.
+    recent_history:
+      - PRE_HOOK write_to_file
+      - INTENT_CONTEXT_INJECTED write_to_file
+      - PRE_HOOK write_to_file
+      - INTENT_CONTEXT_INJECTED write_to_file
+    related_files: []
+  - id: INT-002
+    name: MCP-Only External Action Layer
+    status: IN_PROGRESS
+    owned_scope:
+      - src/mcp/**
+      - src/tools/**
+      - tests/mcp/**
+      - research/specs/mcp_protocols.md
+    constraints:
+      - No direct external API calls from core agents.
+      - All tool actions must pass through MCP servers with logging.
+      - Support both local stdio and remote HTTP/SSE transports.
+    acceptance_criteria:
+      - Tool registry and invocation tests pass for required capabilities.
+      - Audit logs show MCP path for all external actions.
+    recent_history:
+      - POST_HOOK write_to_file OK
+      - PRE_HOOK write_to_file
+      - INTENT_CONTEXT_INJECTED write_to_file
+      - POST_HOOK apply_diff OK
+      - PRE_HOOK apply_diff
+      - INTENT_CONTEXT_INJECTED apply_diff
+      - POST_HOOK apply_diff OK
+      - PRE_HOOK apply_diff
+      - INTENT_CONTEXT_INJECTED apply_diff
+      - POST_HOOK apply_diff OK
+      - PRE_HOOK apply_diff
+      - INTENT_CONTEXT_INJECTED apply_diff
+      - POST_HOOK apply_diff OK
+      - PRE_HOOK apply_diff
+      - INTENT_CONTEXT_INJECTED apply_diff
+      - POST_HOOK apply_diff OK
+      - PRE_HOOK apply_diff
+      - INTENT_CONTEXT_INJECTED apply_diff
+      - POST_HOOK apply_diff OK
+      - PRE_HOOK apply_diff
+    related_files: []
+  - id: INT-003
+    name: Canonical Contracts And Schema Governance
+    status: COMPLETED
+    owned_scope:
+      - specs/canonical_schemas.md
+      - specs/technical.md
+      - research/specs/core_interfaces.md
+      - tests/contracts/**
+      - skills/**
+    constraints:
+      - Task, Result, and Evaluation must align to one canonical schema source.
+      - Schema changes require explicit version bump and compatibility policy.
+      - No conflicting field names across spec files.
+    acceptance_criteria:
+      - Contract validation tests pass for all schema examples.
+      - Schema consistency check reports zero conflicts.
+    recent_history:
+      - POST_HOOK write_to_file OK
+      - PRE_HOOK write_to_file
+      - INTENT_CONTEXT_INJECTED write_to_file
+      - POST_HOOK write_to_file OK
+      - PRE_HOOK write_to_file
+      - INTENT_CONTEXT_INJECTED write_to_file
+      - POST_HOOK write_to_file OK
+      - POST_HOOK apply_diff OK
+      - PRE_HOOK apply_diff
+      - INTENT_CONTEXT_INJECTED apply_diff
+      - POST_HOOK apply_diff OK
+      - PRE_HOOK apply_diff
+      - INTENT_CONTEXT_INJECTED apply_diff
+      - POST_HOOK apply_diff OK
+      - PRE_HOOK apply_diff
+      - INTENT_CONTEXT_INJECTED apply_diff
+      - SCOPE_EXPANDED add_skills_write
+    related_files: []
+  - id: INT-004
+    name: Policy Governance And HITL Enforcement
+    status: PENDING
+    owned_scope:
+      - src/policy/**
+      - src/governance/**
+      - research/specs/AGENTS.md
+      - research/specs/governance_alignment.md
+      - tests/governance/**
+    constraints:
+      - Judge retains veto authority on safety and alignment failures.
+      - Sensitive topics always require human review regardless of confidence.
+      - Policy updates must be centrally managed and propagated fleet-wide.
+    acceptance_criteria:
+      - Policy decision tests cover approve reject escalate branches.
+      - HITL routing behaves per confidence thresholds and sensitive-topic rules.
     recent_history: []
+    related_files: []
+  - id: INT-005
+    name: Persona DNA And Memory Continuity
+    status: PENDING
+    owned_scope:
+      - src/persona/**
+      - src/memory/**
+      - research/specs/SOUL.md
+      - tests/persona/**
+    constraints:
+      - Persona identity must be stable across sessions unless governance-approved.
+      - Short-term and long-term memory must remain tenant and agent scoped.
+      - Context assembly must include policy and persona anchors.
+    acceptance_criteria:
+      - Persona consistency tests pass across multi-session simulations.
+      - Memory retrieval tests return only scoped data.
+    recent_history: []
+    related_files: []
+  - id: INT-006
+    name: Multi-Tenant Data Architecture And Isolation
+    status: PENDING
+    owned_scope:
+      - src/db/**
+      - src/storage/**
+      - migrations/**
+      - tests/data/**
+      - research/specs/data_models.md
+    constraints:
+      - All persistent entities require tenant_id enforcement.
+      - No cross-tenant read/write access in query paths.
+      - Migration strategy must support forward and rollback paths.
+    acceptance_criteria:
+      - Isolation tests prove tenant boundary integrity.
+      - Migration up/down tests pass with representative data.
+    recent_history: []
+    related_files: []
+  - id: INT-007
+    name: Agentic Commerce And Budget Gatekeeping
+    status: PENDING
+    owned_scope:
+      - src/commerce/**
+      - src/cfo_judge/**
+      - src/ledger/**
+      - tests/commerce/**
+      - research/specs/commerce.md
+    constraints:
+      - All transactions must be budget-gated and auditable.
+      - High-risk or threshold-exceeding transactions require approval.
+      - No transfers to untrusted wallets or unverified contracts.
+    acceptance_criteria:
+      - Budget rule tests pass for allow, block, and escalate scenarios.
+      - Ledger and signature trails are complete for every transaction.
+    recent_history: []
+    related_files: []
+  - id: INT-008
+    name: Observability Flight Recorder And Error Taxonomy
+    status: PENDING
+    owned_scope:
+      - src/observability/**
+      - src/logging/**
+      - src/errors/**
+      - tests/observability/**
+    constraints:
+      - Every major state transition must emit structured events.
+      - No PII or secrets in logs.
+      - Error codes must distinguish business policy and system faults.
+    acceptance_criteria:
+      - Trace logs cover plan execute review escalate lifecycle.
+      - Correlation IDs appear across orchestrator and worker flows.
+    recent_history: []
+    related_files: []
+  - id: INT-009
+    name: Fleet Infrastructure And Scale Readiness
+    status: PENDING
+    owned_scope:
+      - Dockerfile
+      - docker-compose.yml
+      - k8s/**
+      - infra/**
+      - tests/perf/**
+    constraints:
+      - Architecture must support horizontal scaling toward 1000+ agents.
+      - Worker processes should scale to zero when idle.
+      - Configuration must be environment-variable driven.
+    acceptance_criteria:
+      - Load tests validate scaling and queue stability targets.
+      - Operational checks verify isolation and autoscaling behavior.
+    recent_history: []
+    related_files: []
+  - id: INT-010
+    name: CI Safety Gates And Spec-Driven Workflow
+    status: PENDING
+    owned_scope:
+      - .github/workflows/**
+      - scripts/**
+      - tests/**
+      - .specify/**
+    constraints:
+      - Build must fail on lint type-check and critical contract-test failure.
+      - Spec consistency checks required before merge.
+      - No default-branch bypass of security and governance checks.
+    acceptance_criteria:
+      - CI blocks merges on failing quality and contract gates.
+      - Spec validation job reports canonical schema compliance.
+    recent_history: []
+    related_files: []

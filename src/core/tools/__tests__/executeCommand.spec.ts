@@ -11,7 +11,24 @@ import { ExecaTerminal } from "../../../integrations/terminal/ExecaTerminal"
 import type { RooTerminalCallbacks } from "../../../integrations/terminal/types"
 
 // Mock fs to control directory existence checks
-vitest.mock("fs/promises")
+vitest.mock("fs/promises", () => {
+	const access = vitest.fn()
+	const readFile = vitest.fn()
+	const writeFile = vitest.fn()
+	const appendFile = vitest.fn()
+	return {
+		access,
+		readFile,
+		writeFile,
+		appendFile,
+		default: {
+			access,
+			readFile,
+			writeFile,
+			appendFile,
+		},
+	}
+})
 
 // Mock TerminalRegistry to control terminal creation
 vitest.mock("../../../integrations/terminal/TerminalRegistry")
@@ -35,6 +52,9 @@ describe("executeCommand", () => {
 
 		// Mock fs.access to simulate directory existence
 		;(fs.access as any).mockResolvedValue(undefined)
+		;(fs.readFile as any).mockRejectedValue(Object.assign(new Error("ENOENT"), { code: "ENOENT" }))
+		;(fs.writeFile as any).mockResolvedValue(undefined)
+		;(fs.appendFile as any).mockResolvedValue(undefined)
 
 		// Create mock provider
 		mockProvider = {
@@ -360,6 +380,55 @@ describe("executeCommand", () => {
 			expect(result).toContain("Command execution was not successful")
 			expect(result).toContain("Exit code: 1")
 			expect(result).toContain("within working directory '/test/project'")
+		})
+
+		it("appends lessons learned to CLAUDE.md when verification command fails", async () => {
+			mockTerminal.getCurrentWorkingDirectory.mockReturnValue("/test/project")
+			mockTerminal.runCommand.mockImplementation((command: string, callbacks: RooTerminalCallbacks) => {
+				setTimeout(() => {
+					callbacks.onCompleted("1 failing test in suite", mockProcess)
+					callbacks.onShellExecutionComplete({ exitCode: 1 }, mockProcess)
+				}, 0)
+				return mockProcess
+			})
+
+			const options: ExecuteCommandOptions = {
+				executionId: "test-lesson-1",
+				command: "pnpm test",
+				terminalShellIntegrationDisabled: false,
+			}
+
+			await executeCommandInTerminal(mockTask, options)
+
+			const claudePath = path.join(mockTask.cwd, "CLAUDE.md")
+			expect(fs.writeFile).toHaveBeenCalledWith(claudePath, expect.stringContaining("# CLAUDE"), "utf8")
+			expect(fs.appendFile).toHaveBeenCalledWith(
+				claudePath,
+				expect.stringContaining("command=`pnpm test` | status=exit_1"),
+				"utf8",
+			)
+		})
+
+		it("does not append lessons learned for non-verification command failures", async () => {
+			mockTerminal.getCurrentWorkingDirectory.mockReturnValue("/test/project")
+			mockTerminal.runCommand.mockImplementation((command: string, callbacks: RooTerminalCallbacks) => {
+				setTimeout(() => {
+					callbacks.onCompleted("script failed", mockProcess)
+					callbacks.onShellExecutionComplete({ exitCode: 1 }, mockProcess)
+				}, 0)
+				return mockProcess
+			})
+
+			const options: ExecuteCommandOptions = {
+				executionId: "test-lesson-2",
+				command: "node scripts/migrate.js",
+				terminalShellIntegrationDisabled: false,
+			}
+
+			await executeCommandInTerminal(mockTask, options)
+
+			expect(fs.writeFile).not.toHaveBeenCalled()
+			expect(fs.appendFile).not.toHaveBeenCalled()
 		})
 
 		it("should handle command terminated by signal", async () => {

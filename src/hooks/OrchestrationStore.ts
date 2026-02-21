@@ -32,7 +32,7 @@ export interface AgentTraceConversation {
 	}
 	ranges: AgentTraceRange[]
 	related: Array<{
-		type: "specification"
+		type: "specification" | "mutation_class"
 		value: string
 	}>
 }
@@ -56,6 +56,13 @@ export interface AgentTraceRecord {
 		prev_record_hash: string | null
 		record_hash: string
 	}
+}
+
+export interface AgentTraceReference {
+	timestamp: string
+	relative_path: string
+	content_hash: string
+	specification_value: string
 }
 
 export interface SidecarDenyMutationRule {
@@ -107,10 +114,16 @@ const traceConversationSchema = z.object({
 	ranges: z.array(traceRangeSchema).min(1),
 	related: z
 		.array(
-			z.object({
-				type: z.literal("specification"),
-				value: z.string().min(1),
-			}),
+			z.union([
+				z.object({
+					type: z.literal("specification"),
+					value: z.string().min(1),
+				}),
+				z.object({
+					type: z.literal("mutation_class"),
+					value: z.enum(["AST_REFACTOR", "INTENT_EVOLUTION"]),
+				}),
+			]),
 		)
 		.min(1),
 })
@@ -171,6 +184,14 @@ const DEFAULT_SIDECAR_POLICY_YAML = [
 	"  deny_mutations:",
 	'    - path_glob: ".orchestration/**"',
 	'      reason: "Orchestration control-plane files are hook-managed."',
+	"",
+].join("\n")
+const DEFAULT_INTENT_IGNORE = [
+	"# .intentignore",
+	"# One intent id or glob per line (supports * and **).",
+	"# Examples:",
+	"# INT-001",
+	"# INT-*",
 	"",
 ].join("\n")
 
@@ -251,6 +272,7 @@ export class OrchestrationStore {
 	static readonly SHARED_BRAIN_FILE = "AGENT.md"
 	static readonly GOVERNANCE_LEDGER_FILE = "governance_ledger.md"
 	static readonly SIDECAR_POLICY_FILE = "constraints.sidecar.yaml"
+	static readonly INTENT_IGNORE_FILE = ".intentignore"
 	static readonly REQUIRED_ORCHESTRATION_FILES = [
 		OrchestrationStore.ACTIVE_INTENTS_FILE,
 		OrchestrationStore.AGENT_TRACE_FILE,
@@ -289,6 +311,10 @@ export class OrchestrationStore {
 		return path.join(this.orchestrationDirPath, OrchestrationStore.SIDECAR_POLICY_FILE)
 	}
 
+	get intentIgnorePath(): string {
+		return path.join(this.workspacePath, OrchestrationStore.INTENT_IGNORE_FILE)
+	}
+
 	async ensureInitialized(): Promise<void> {
 		await fs.mkdir(this.orchestrationDirPath, { recursive: true })
 		await this.ensureFile(this.activeIntentsPath, DEFAULT_ACTIVE_INTENTS_YAML)
@@ -297,6 +323,16 @@ export class OrchestrationStore {
 		await this.ensureFile(this.sharedBrainPath, DEFAULT_SHARED_BRAIN_MD)
 		await this.ensureFile(this.governanceLedgerPath, DEFAULT_GOVERNANCE_LEDGER_MD)
 		await this.ensureFile(this.sidecarPolicyPath, DEFAULT_SIDECAR_POLICY_YAML)
+		await this.ensureFile(this.intentIgnorePath, DEFAULT_INTENT_IGNORE)
+	}
+
+	async loadIntentIgnorePatterns(): Promise<string[]> {
+		await this.ensureInitialized()
+		const raw = await fs.readFile(this.intentIgnorePath, "utf8")
+		return raw
+			.split(/\r?\n/)
+			.map((line) => line.trim())
+			.filter((line) => line.length > 0 && !line.startsWith("#"))
 	}
 
 	async loadIntents(): Promise<ActiveIntentRecord[]> {
@@ -382,6 +418,56 @@ export class OrchestrationStore {
 		}
 		this.validateTraceRecord(recordWithIntegrity)
 		await fs.appendFile(this.agentTracePath, `${JSON.stringify(recordWithIntegrity)}\n`, "utf8")
+	}
+
+	async loadRecentTraceReferencesForSpecifications(
+		specificationIds: string[],
+		limit: number = 20,
+	): Promise<AgentTraceReference[]> {
+		await this.ensureInitialized()
+		const targets = new Set(specificationIds.map((id) => id.trim()).filter(Boolean))
+		if (targets.size === 0) {
+			return []
+		}
+
+		const raw = await fs.readFile(this.agentTracePath, "utf8")
+		const lines = raw
+			.split(/\r?\n/)
+			.map((line) => line.trim())
+			.filter(Boolean)
+		if (lines.length === 0) {
+			return []
+		}
+
+		const refs: AgentTraceReference[] = []
+		for (const line of lines) {
+			let parsed: AgentTraceRecord
+			try {
+				parsed = JSON.parse(line) as AgentTraceRecord
+			} catch {
+				continue
+			}
+
+			for (const file of parsed.files ?? []) {
+				for (const conversation of file.conversations ?? []) {
+					for (const related of conversation.related ?? []) {
+						if (related.type !== "specification" || !targets.has(related.value)) {
+							continue
+						}
+						for (const range of conversation.ranges ?? []) {
+							refs.push({
+								timestamp: parsed.timestamp,
+								relative_path: file.relative_path,
+								content_hash: range.content_hash,
+								specification_value: related.value,
+							})
+						}
+					}
+				}
+			}
+		}
+
+		return refs.sort((a, b) => b.timestamp.localeCompare(a.timestamp)).slice(0, limit)
 	}
 
 	async appendIntentMapEntry(

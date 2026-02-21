@@ -64,7 +64,13 @@ export class SelectActiveIntentTool extends BaseTool<"select_active_intent"> {
 			task.authorizeIntentCheckoutForTurn(result.context.id)
 			await intentContextService.markIntentInProgress(result.context.id)
 			task.consecutiveMistakeCount = 0
-			const interceptedContext = task.consumePendingIntentHandshakeContext()
+			const interceptedContext =
+				typeof (task as Task & { consumePendingIntentHandshakeContext?: () => string | undefined })
+					.consumePendingIntentHandshakeContext === "function"
+					? (
+							task as Task & { consumePendingIntentHandshakeContext: () => string | undefined }
+						).consumePendingIntentHandshakeContext()
+					: undefined
 			pushToolResult(interceptedContext ?? result.message)
 		} catch (error) {
 			await handleError("selecting active intent", error as Error)

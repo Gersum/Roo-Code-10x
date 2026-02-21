@@ -214,6 +214,67 @@ Post-hook side effects:
 2. For mutating success: append `agent_trace.jsonl` and `intent_map.md`.
 3. For failures/scope issues/completion evolution: append `AGENT.md`.
 
+### G. Advanced Hook Checks (Phase 1)
+
+The Hook Engine includes specific integrity checks beyond basic policy:
+
+1. **Stale File Protection**:
+
+    - Captures `content_hash` when files are read by the Agent.
+    - In `preToolUse`, compares the cached hash with the current disk hash.
+    - **Denies** execution if the file changed on disk (preventing race conditions).
+
+2. **Orchestration Drift Check**:
+
+    - Validates the integrity of the `.orchestration/` directory structure.
+    - **Denies** execution if `active_intents.yaml` or other required files are missing or corrupt.
+
+3. **Human-in-the-Loop (HITL) Gate**:
+    - Even if all automated checks pass, mutating tools trigger a `requestHitlAuthorization`.
+    - Prompts the user via VS Code UI to explicitly approve the specific mutation and intent.
+
+## Intent-Based Workflow
+
+The lifecycle of an **active intent** drives which files the agent is allowed to mutate and tracks progress. The diagram below shows how intent selection, scope enforcement, and completion are managed by the Hook Engine.
+
+```mermaid
+flowchart TD
+    start([Start Task]) --> select{Model calls select_active_intent(intent_id)}
+    select -- valid --> scopeCheck[HookEngine preToolUse
+    - verify intent exists
+    - inject context XML]
+    select -- invalid --> reject1[Error: invalid intent]
+    scopeCheck --> toolCall[Agent issues mutating tool]
+    toolCall --> insideScope{Path inside owned_scope?}
+    insideScope -- no --> denyScope[Deny via pre-hook & append shared brain]
+    insideScope -- yes --> staleCheck{Stale file?}
+    staleCheck -- yes --> denyStale[Deny with STALE_FILE error]
+    staleCheck -- no --> hitl[Human-in-the-loop approval]
+    hitl -- denied --> denyAuth[Deny: user rejected]
+    hitl -- approved --> execute[Tool executes]
+    execute --> post[HookEngine postToolUse
+    - append trace
+    - update intent history/complete]
+    post --> checkCompletion{Tool was attempt_completion?}
+    checkCompletion -- yes --> markDone[Intent marked COMPLETED]
+    checkCompletion -- no --> continue[Loop for next tool]
+
+    reject1 --> end([End])
+    denyScope --> end
+    denyStale --> end
+    denyAuth --> end
+    markDone --> end
+    continue --> toolCall
+```
+
+### Explanation
+
+- **Intent Checkout** – The agent must explicitly select an active intent before any mutating action.
+- **Scope Enforcement** – Every write is checked against the `owned_scope` globs defined by the intent.
+- **Stale File Protection** – Files modified by external actors are detected and blocked.
+- **HITL Gate** – Users vote to approve or reject each mutation, ensuring oversight.
+- **Completion** – A successful `attempt_completion` tool marks the intent as `COMPLETED` in `active_intents.yaml`.
+
 ## 1. Fork & Run Status
 
 This workspace already contains the Roo Code source and is buildable.

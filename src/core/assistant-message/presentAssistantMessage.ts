@@ -43,6 +43,47 @@ import { hookEngine, type HookPreToolUseContext } from "../../hooks/HookEngine"
 import { formatResponse } from "../prompts/responses"
 import { sanitizeToolUseId } from "../../utils/tool-id"
 
+type WriteToFileMutationClass = "AST_REFACTOR" | "INTENT_EVOLUTION"
+
+export function normalizeWriteToFileToolUseForDispatch(
+	task: Pick<Task, "activeIntentId">,
+	block: ToolUse,
+): { ok: true } | { ok: false; errorMessage: string } {
+	if (block.name !== "write_to_file" || block.partial) {
+		return { ok: true }
+	}
+
+	const nativeArgs = (block.nativeArgs as Record<string, unknown> | undefined) ?? {}
+	const hasIntentId = typeof nativeArgs.intent_id === "string" && nativeArgs.intent_id.trim().length > 0
+	if (!hasIntentId) {
+		const activeIntentId = task.activeIntentId?.trim()
+		if (!activeIntentId) {
+			return {
+				ok: false,
+				errorMessage:
+					"Missing value for required parameter 'intent_id' and no active intent is selected. Call select_active_intent first.",
+			}
+		}
+		nativeArgs.intent_id = activeIntentId
+		block.params.intent_id = activeIntentId
+	}
+
+	const hasMutationClass =
+		typeof nativeArgs.mutation_class === "string" &&
+		(nativeArgs.mutation_class === "AST_REFACTOR" || nativeArgs.mutation_class === "INTENT_EVOLUTION")
+	if (!hasMutationClass) {
+		const defaultMutationClass: WriteToFileMutationClass = "AST_REFACTOR"
+		nativeArgs.mutation_class = defaultMutationClass
+		block.params.mutation_class = defaultMutationClass
+	}
+
+	if (!block.nativeArgs) {
+		block.nativeArgs = nativeArgs as never
+	}
+
+	return { ok: true }
+}
+
 /**
  * Processes and presents assistant message content to the user interface.
  *
@@ -443,6 +484,21 @@ export async function presentAssistantMessage(cline: Task) {
 						is_error: true,
 					})
 
+					break
+				}
+			}
+
+			if (!block.partial) {
+				const normalizedWriteToolUse = normalizeWriteToFileToolUseForDispatch(cline, block as ToolUse)
+				if (!normalizedWriteToolUse.ok) {
+					cline.consecutiveMistakeCount++
+					cline.recordToolError("write_to_file", normalizedWriteToolUse.errorMessage)
+					cline.pushToolResultToUserContent({
+						type: "tool_result",
+						tool_use_id: sanitizeToolUseId(toolCallId),
+						content: formatResponse.toolError(normalizedWriteToolUse.errorMessage),
+						is_error: true,
+					})
 					break
 				}
 			}

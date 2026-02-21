@@ -24,6 +24,7 @@ import { extractTextFromFile, addLineNumbers, getSupportedBinaryFormats } from "
 import { readWithIndentation, readWithSlice } from "../../integrations/misc/indentation-reader"
 import { DEFAULT_LINE_LIMIT } from "../prompts/tools/native-tools/read_file"
 import type { ToolUse, PushToolResult } from "../../shared/tools"
+import { sha256OfBuffer } from "../../utils/hash"
 
 import {
 	DEFAULT_MAX_IMAGE_FILE_SIZE_MB,
@@ -217,6 +218,11 @@ export class ReadFileTool extends BaseTool<"read_file"> {
 					const buffer = await fs.readFile(fullPath)
 					const fileContent = buffer.toString("utf-8")
 					const result = this.processTextFile(fileContent, entry)
+					if (typeof (task as Task & { recordFileReadHash?: unknown }).recordFileReadHash === "function") {
+						;(
+							task as Task & { recordFileReadHash: (path: string, hash: string) => void }
+						).recordFileReadHash(relPath, sha256OfBuffer(buffer))
+					}
 
 					await task.fileContextTracker.trackFileContext(relPath, "read_tool" as RecordSource)
 
@@ -767,7 +773,14 @@ export class ReadFileTool extends BaseTool<"read_file"> {
 				}
 
 				// Read text file
-				const rawContent = await fs.readFile(fullPath, "utf8")
+				const rawBuffer = await fs.readFile(fullPath)
+				const rawContent = rawBuffer.toString("utf8")
+				if (typeof (task as Task & { recordFileReadHash?: unknown }).recordFileReadHash === "function") {
+					;(task as Task & { recordFileReadHash: (path: string, hash: string) => void }).recordFileReadHash(
+						relPath,
+						sha256OfBuffer(rawBuffer),
+					)
+				}
 
 				// Handle line ranges if specified
 				let content: string

@@ -213,11 +213,15 @@ describe("writeToFileTool", () => {
 			params: {
 				path: testFilePath,
 				content: testContent,
+				intent_id: "INT-TEST",
+				mutation_class: "AST_REFACTOR",
 				...params,
 			},
 			nativeArgs: {
-				path: (params.path ?? testFilePath) as any,
-				content: (params.content ?? testContent) as any,
+				path: ("path" in params ? params.path : testFilePath) as any,
+				content: ("content" in params ? params.content : testContent) as any,
+				intent_id: ("intent_id" in params ? params.intent_id : "INT-TEST") as any,
+				mutation_class: ("mutation_class" in params ? params.mutation_class : "AST_REFACTOR") as any,
 			},
 			partial: isPartial,
 		}
@@ -236,6 +240,18 @@ describe("writeToFileTool", () => {
 	}
 
 	describe("access control", () => {
+		it("returns missing param error when intent_id is not provided", async () => {
+			await executeWriteFileTool({ intent_id: undefined })
+
+			expect(mockCline.sayAndCreateMissingParamError).toHaveBeenCalledWith("write_to_file", "intent_id")
+		})
+
+		it("returns missing param error when mutation_class is not provided", async () => {
+			await executeWriteFileTool({ mutation_class: undefined })
+
+			expect(mockCline.sayAndCreateMissingParamError).toHaveBeenCalledWith("write_to_file", "mutation_class")
+		})
+
 		it("validates and allows access when rooIgnoreController permits", async () => {
 			await executeWriteFileTool({}, { accessAllowed: true })
 
