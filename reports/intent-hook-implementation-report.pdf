@@ -1,0 +1,842 @@
+%PDF-1.4
+%‚„œ”
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [ 5 0 R 7 0 R 9 0 R 11 0 R 13 0 R 15 0 R ] /Count 6 >>
+endobj
+3 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>
+endobj
+4 0 obj
+<< /Length 3024 >>
+stream
+BT
+/F1 10 Tf
+42 800 Td
+12 TL
+(# Intent-Driven Hook Architecture Report) Tj
+T*
+() Tj
+T*
+(Date: 2026-02-21) Tj
+T*
+(Repository: Roo-Code extension) Tj
+T*
+(Scope: Intent handshake, pre/post hook middleware, semantic traceability, optimistic locking, and ) Tj
+T*
+(safety guardrails.) Tj
+T*
+() Tj
+T*
+(## 1\) Executive Summary) Tj
+T*
+() Tj
+T*
+(This implementation resolves the "context paradox" between asynchronous IDE interaction and ) Tj
+T*
+(synchronous LLM tool execution by introducing an explicit intent checkout handshake and ) Tj
+T*
+(deterministic hook enforcement.) Tj
+T*
+() Tj
+T*
+(The delivered system now enforces:) Tj
+T*
+() Tj
+T*
+(- Intent-first mutation flow \(`select_active_intent` before writes/edits\).) Tj
+T*
+(- Strong pre-hook controls \(scope, checkout stage, HITL, sidecar, intent ignore, stale-file, spec-) Tj
+T*
+(iteration guard\).) Tj
+T*
+(- Post-hook semantic ledgering \(`agent_trace.jsonl` with integrity chaining and mutation-class ) Tj
+T*
+(attribution\).) Tj
+T*
+(- Recovery and learning mechanisms \(structured hook errors; verification-failure lessons captured in) Tj
+T*
+( the repo knowledge base `AGENT.md`\).) Tj
+T*
+() Tj
+T*
+(## 2\) Implemented Architecture) Tj
+T*
+() Tj
+T*
+(### 2.1 Components) Tj
+T*
+() Tj
+T*
+(1. Prompt Handshake Contract) Tj
+T*
+() Tj
+T*
+(- File: `src/core/prompts/system.ts`) Tj
+T*
+(- Injects a mandatory intent protocol in the system prompt:) Tj
+T*
+(    - First mutating flow must call `select_active_intent`.) Tj
+T*
+(    - Mutating tools forbidden until checkout succeeds.) Tj
+T*
+() Tj
+T*
+(2. Intent Selection Tool + Context Loader) Tj
+T*
+() Tj
+T*
+(- Tool schema: `src/core/prompts/tools/native-tools/select_active_intent.ts`) Tj
+T*
+(- Runtime tool: `src/core/tools/SelectActiveIntentTool.ts`) Tj
+T*
+(- Context source: `.orchestration/active_intents.yaml` via `IntentContextService`.) Tj
+T*
+(- Hook interception \(`HookEngine.preToolUse`\) constructs and injects `<intent_context>` XML for ) Tj
+T*
+(selected intent.) Tj
+T*
+() Tj
+T*
+(3. Hook Middleware \(Pre/Post\)) Tj
+T*
+() Tj
+T*
+(- File: `src/hooks/HookEngine.ts`) Tj
+T*
+(- Pre-hook controls:) Tj
+T*
+(    - Command classification \(`safe` vs `destructive`\).) Tj
+T*
+(    - Two-stage checkout state machine \(`checkout_required` ? `execution_authorized`\).) Tj
+T*
+(    - Contract validation for `.orchestration` control-plane files.) Tj
+T*
+(    - Sidecar policy \(`constraints.sidecar.yaml`\) and deny-list checks.) Tj
+T*
+(    - Workspace boundary and owned-scope enforcement.) Tj
+T*
+(    - `.intentignore` intent exclusion.) Tj
+T*
+(    - HITL modal/ask gate \(`Approve/Reject`\).) Tj
+T*
+(    - Optimistic lock stale-file blocking.) Tj
+T*
+(    - Numbered spec creation guard \(new `specs/NNN-*` requires `INTENT_EVOLUTION`\).) Tj
+T*
+(- Post-hook controls:) Tj
+T*
+(    - Governance ledger append.) Tj
+T*
+(    - Intent history/status updates.) Tj
+T*
+(    - Semantic trace serialization to `agent_trace.jsonl`.) Tj
+T*
+() Tj
+T*
+(4. Orchestration Persistence Layer) Tj
+T*
+() Tj
+T*
+(- File: `src/hooks/OrchestrationStore.ts`) Tj
+T*
+ET
+endstream
+endobj
+5 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 3 0 R >> >> /Contents 4 0 R >>
+endobj
+6 0 obj
+<< /Length 2596 >>
+stream
+BT
+/F1 10 Tf
+42 800 Td
+12 TL
+(- Manages:) Tj
+T*
+(    - `active_intents.yaml`) Tj
+T*
+(    - `agent_trace.jsonl`) Tj
+T*
+(    - `intent_map.md`) Tj
+T*
+(    - `governance_ledger.md`) Tj
+T*
+(    - `constraints.sidecar.yaml`) Tj
+T*
+(    - `.intentignore`) Tj
+T*
+(- Validates agent trace schema with Zod and adds SHA-256 chain integrity \(`prev_record_hash`, ) Tj
+T*
+(`record_hash`\).) Tj
+T*
+() Tj
+T*
+(5. Dispatch Shim for Write Robustness) Tj
+T*
+() Tj
+T*
+(- File: `src/core/assistant-message/presentAssistantMessage.ts`) Tj
+T*
+(- `normalizeWriteToFileToolUseForDispatch\(...\)` behavior:) Tj
+T*
+(    - If `write_to_file.intent_id` missing and `task.activeIntentId` exists: auto-fill.) Tj
+T*
+(    - If `mutation_class` missing: default `AST_REFACTOR`.) Tj
+T*
+(    - Hard fail only if no active intent exists.) Tj
+T*
+() Tj
+T*
+(6. Optimistic Concurrency + Lessons Learned) Tj
+T*
+() Tj
+T*
+(- Read hash capture: `src/core/tools/ReadFileTool.ts`) Tj
+T*
+(- Turn-scoped hash store: `src/core/task/Task.ts`) Tj
+T*
+(- Stale-file detection pre-write: `src/hooks/HookEngine.ts`) Tj
+T*
+(- Verification failure lesson append: `src/core/tools/ExecuteCommandTool.ts` \(repo knowledge base ) Tj
+T*
+(target: `AGENT.md`\)) Tj
+T*
+() Tj
+T*
+(## 3\) Schemas and Contracts) Tj
+T*
+() Tj
+T*
+(### 3.1 Native Tool Schema: `select_active_intent`) Tj
+T*
+() Tj
+T*
+(Source: `src/core/prompts/tools/native-tools/select_active_intent.ts`) Tj
+T*
+() Tj
+T*
+(```json) Tj
+T*
+({) Tj
+T*
+(        "name": "select_active_intent",) Tj
+T*
+(        "parameters": {) Tj
+T*
+(                "type": "object",) Tj
+T*
+(                "properties": {) Tj
+T*
+(                        "intent_id": { "type": "string" }) Tj
+T*
+(                },) Tj
+T*
+(                "required": ["intent_id"],) Tj
+T*
+(                "additionalProperties": false) Tj
+T*
+(        }) Tj
+T*
+(}) Tj
+T*
+(```) Tj
+T*
+() Tj
+T*
+(### 3.2 Native Tool Schema: `write_to_file`) Tj
+T*
+() Tj
+T*
+(Source: `src/core/prompts/tools/native-tools/write_to_file.ts`) Tj
+T*
+() Tj
+T*
+(```json) Tj
+T*
+({) Tj
+T*
+(        "name": "write_to_file",) Tj
+T*
+(        "parameters": {) Tj
+T*
+(                "type": "object",) Tj
+T*
+(                "properties": {) Tj
+T*
+(                        "path": { "type": "string" },) Tj
+T*
+(                        "content": { "type": "string" },) Tj
+T*
+(                        "intent_id": { "type": "string" },) Tj
+T*
+(                        "mutation_class": {) Tj
+T*
+(                                "type": "string",) Tj
+T*
+(                                "enum": ["AST_REFACTOR", "INTENT_EVOLUTION"]) Tj
+T*
+(                        }) Tj
+T*
+ET
+endstream
+endobj
+7 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 3 0 R >> >> /Contents 6 0 R >>
+endobj
+8 0 obj
+<< /Length 2540 >>
+stream
+BT
+/F1 10 Tf
+42 800 Td
+12 TL
+(                },) Tj
+T*
+(                "required": ["path", "content", "intent_id", "mutation_class"],) Tj
+T*
+(                "additionalProperties": false) Tj
+T*
+(        }) Tj
+T*
+(}) Tj
+T*
+(```) Tj
+T*
+() Tj
+T*
+(### 3.3 Agent Trace Record Schema) Tj
+T*
+() Tj
+T*
+(Source: `src/hooks/OrchestrationStore.ts`) Tj
+T*
+() Tj
+T*
+(Record includes:) Tj
+T*
+() Tj
+T*
+(- `id`, `timestamp`, `vcs.revision_id`) Tj
+T*
+(- `files[]` with:) Tj
+T*
+(    - `relative_path`) Tj
+T*
+(    - optional `ast_fingerprint` \(`parser=tree-sitter`, `summary_hash=sha256:...`\)) Tj
+T*
+(    - `conversations[]`:) Tj
+T*
+(        - `url`, `contributor`) Tj
+T*
+(        - `ranges[]` \(`start_line`, `end_line`, `content_hash`\)) Tj
+T*
+(        - `related[]`: `specification` and optional `mutation_class`) Tj
+T*
+(- optional `integrity`:) Tj
+T*
+(    - `chain=sha256`) Tj
+T*
+(    - `prev_record_hash`) Tj
+T*
+(    - `record_hash`) Tj
+T*
+() Tj
+T*
+(Validation:) Tj
+T*
+() Tj
+T*
+(- Zod schema checks UUID, timestamp format, hash regex, range semantics.) Tj
+T*
+() Tj
+T*
+(## 4\) Detailed Agent Flow \(Turn Lifecycle\)) Tj
+T*
+() Tj
+T*
+(### 4.1 Stage A: Intent Declaration) Tj
+T*
+() Tj
+T*
+(1. Model analyzes user request.) Tj
+T*
+(2. Model calls `select_active_intent\(intent_id\)`.) Tj
+T*
+(3. Pre-hook intercepts and loads intent from active intents store.) Tj
+T*
+(4. Hook injects `<intent_context>` XML \(scope + constraints\).) Tj
+T*
+(5. `SelectActiveIntentTool` authorizes checkout for the turn \(`execution_authorized`\).) Tj
+T*
+() Tj
+T*
+(### 4.2 Stage B: Tool Dispatch and Pre-Hook Gating) Tj
+T*
+() Tj
+T*
+(For each tool call:) Tj
+T*
+() Tj
+T*
+(1. Dispatch shim normalizes `write_to_file` args \(intent/mutation defaults\).) Tj
+T*
+(2. Pre-hook evaluates:) Tj
+T*
+(    - mutating tool classification) Tj
+T*
+(    - checkout stage gate) Tj
+T*
+(    - orchestration contract drift) Tj
+T*
+(    - sidecar blocked tools / denied mutation paths) Tj
+T*
+(    - out-of-workspace mutations) Tj
+T*
+(    - active intent validity) Tj
+T*
+(    - `.intentignore` pattern exclusion) Tj
+T*
+(    - `owned_scope` membership) Tj
+T*
+(    - stale file check \(optimistic lock\)) Tj
+T*
+(    - numbered spec creation guard \(`specs/NNN-*` + mutation class\)) Tj
+T*
+(    - HITL approval) Tj
+T*
+(3. On deny: standardized hook error or explicit scope message is returned.) Tj
+T*
+() Tj
+T*
+(### 4.3 Stage C: Tool Execution) Tj
+T*
+() Tj
+T*
+(- Tool executes only after passing pre-hook.) Tj
+T*
+(- `write_to_file` still performs its own required-param checks and approval flow.) Tj
+T*
+ET
+endstream
+endobj
+9 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 3 0 R >> >> /Contents 8 0 R >>
+endobj
+10 0 obj
+<< /Length 2551 >>
+stream
+BT
+/F1 10 Tf
+42 800 Td
+12 TL
+() Tj
+T*
+(### 4.4 Stage D: Post-Hook Audit and Trace) Tj
+T*
+() Tj
+T*
+(1. Governance ledger append \(`OK|FAILED|DENIED` metadata\).) Tj
+T*
+(2. Intent `recent_history` update.) Tj
+T*
+(3. For successful mutating tools:) Tj
+T*
+(    - Build trace record with content hash and optional AST fingerprint.) Tj
+T*
+(    - Inject `specification` and `mutation_class` in `related[]`.) Tj
+T*
+(    - Append to `agent_trace.jsonl` with chain integrity.) Tj
+T*
+(4. `attempt_completion` success marks intent `COMPLETED`.) Tj
+T*
+() Tj
+T*
+(## 5\) Guardrails Implemented \(What Blocks What\)) Tj
+T*
+() Tj
+T*
+(1. Missing Intent Gate) Tj
+T*
+() Tj
+T*
+(- Error: `You must cite a valid active Intent ID.`) Tj
+T*
+(- Trigger: no active intent or invalid id for mutating tool.) Tj
+T*
+() Tj
+T*
+(2. Checkout Stage Gate) Tj
+T*
+() Tj
+T*
+(- Error: `PreToolUse denied ... intent checkout required for this turn.`) Tj
+T*
+(- Trigger: mutating tool before `select_active_intent` in current turn.) Tj
+T*
+() Tj
+T*
+(3. Scope Gate) Tj
+T*
+() Tj
+T*
+(- Error: `Scope Violation: <REQ/INTENT> is not authorized to edit <path>. Request scope expansion.`) Tj
+T*
+(- Trigger: write outside `owned_scope`.) Tj
+T*
+() Tj
+T*
+(4. Intent Ignore Gate) Tj
+T*
+() Tj
+T*
+(- Structured error code: `INTENT_IGNORED`) Tj
+T*
+(- Trigger: active intent matched in `.intentignore`.) Tj
+T*
+() Tj
+T*
+(5. Stale File Gate) Tj
+T*
+() Tj
+T*
+(- Structured error code: `STALE_FILE`) Tj
+T*
+(- Trigger: file changed since it was read this turn.) Tj
+T*
+() Tj
+T*
+(6. HITL Authorization Gate) Tj
+T*
+() Tj
+T*
+(- Structured error code: `HITL_REJECTED`) Tj
+T*
+(- Trigger: user reject in modal/ask flow.) Tj
+T*
+() Tj
+T*
+(7. Spec Iteration Gate \(new\)) Tj
+T*
+() Tj
+T*
+(- Structured error code: `SPEC_ITERATION_REQUIRES_INTENT_EVOLUTION`) Tj
+T*
+(- Trigger: creating new `specs/NNN-*` file with non-`INTENT_EVOLUTION` mutation class.) Tj
+T*
+() Tj
+T*
+(## 6\) Traceability and Integrity Notes) Tj
+T*
+() Tj
+T*
+(- Content hashing:) Tj
+T*
+(    - Reads/writes use SHA-256 for stale-file checks and trace ranges.) Tj
+T*
+(- Chain-of-custody:) Tj
+T*
+(    - `agent_trace.jsonl` links entries via `prev_record_hash` -> `record_hash`.) Tj
+T*
+(- Semantic attribution:) Tj
+T*
+(    - `mutation_class` persisted for downstream audits \(`AST_REFACTOR` vs `INTENT_EVOLUTION`\).) Tj
+T*
+(- Scope + decision provenance:) Tj
+T*
+(    - `governance_ledger.md` records status, tool, intent, touched paths, sidecar constraints.) Tj
+T*
+() Tj
+T*
+(## 7\) What Has Been Achieved) Tj
+T*
+() Tj
+T*
+(### Completed Capabilities) Tj
+T*
+() Tj
+T*
+ET
+endstream
+endobj
+11 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 3 0 R >> >> /Contents 10 0 R >>
+endobj
+12 0 obj
+<< /Length 2862 >>
+stream
+BT
+/F1 10 Tf
+42 800 Td
+12 TL
+(- Intent-first protocol integrated into system prompt and runtime execution.) Tj
+T*
+(- Deterministic pre-hook governance over all mutating flows.) Tj
+T*
+(- Formal tool schema enforcement for intent + mutation semantics.) Tj
+T*
+(- Automatic write shim to reduce model/tooling friction.) Tj
+T*
+(- Scope and boundary protection with actionable errors.) Tj
+T*
+(- HITL approval integrated into pre-dispatch gate.) Tj
+T*
+(- Optimistic locking to prevent parallel overwrite races.) Tj
+T*
+(- Agent trace ledger with semantic + cryptographic integrity metadata.) Tj
+T*
+(- Verification-failure lesson persistence to `AGENT.md`.) Tj
+T*
+(- New numbered-spec creation guardrail tied to mutation semantics.) Tj
+T*
+() Tj
+T*
+(### Operational Impact) Tj
+T*
+() Tj
+T*
+(- Eliminates silent context drift between user intent and write execution.) Tj
+T*
+(- Converts failures into structured recoverable tool errors.) Tj
+T*
+(- Increases trust with auditable, hash-linked mutation records.) Tj
+T*
+(- Supports safe parallel workflows by blocking stale writes.) Tj
+T*
+() Tj
+T*
+(## 8\) Validation Evidence) Tj
+T*
+() Tj
+T*
+(Focused tests and checks executed for this implementation:) Tj
+T*
+() Tj
+T*
+(- Typecheck: `pnpm -C src check-types`) Tj
+T*
+(- Tests:) Tj
+T*
+(    - `src/hooks/__tests__/HookEngine.spec.ts`) Tj
+T*
+(    - `src/core/assistant-message/__tests__/presentAssistantMessage-writeToFile-shim.spec.ts`) Tj
+T*
+(- Result: Passing \(including new spec-iteration deny/allow tests\).) Tj
+T*
+() Tj
+T*
+(## 9\) Known Constraints / Follow-ups) Tj
+T*
+() Tj
+T*
+(1. `apply_diff` matching is brittle in high-churn sections \(`recent_history`\); safer patch anchors ) Tj
+T*
+(are recommended.) Tj
+T*
+(2. The write shim applies only to `write_to_file`; similar normalizers could be added for future ) Tj
+T*
+(schema-evolving mutators.) Tj
+T*
+(3. Telemetry and governance rollups are implemented \(`src/hooks/GovernanceRollupService.ts`\) and can) Tj
+T*
+( be further extended with webview dashboard visualizations.) Tj
+T*
+() Tj
+T*
+(## 10\) End to End architecture) Tj
+T*
+() Tj
+T*
+(flowchart TD) Tj
+T*
+(subgraph UI_Plane [UI Plane]) Tj
+T*
+(U[User]) Tj
+T*
+(WV[Webview UI]) Tj
+T*
+(end) Tj
+T*
+() Tj
+T*
+(    subgraph Logic_Plane [Logic Plane]) Tj
+T*
+(        WMH[webviewMessageHandler]) Tj
+T*
+(        CP[ClineProvider]) Tj
+T*
+(        TK[Task Runtime]) Tj
+T*
+(        API[Assistant API]) Tj
+T*
+(        NTP[NativeToolCallParser]) Tj
+T*
+(        DISPATCH[presentAssistantMessage]) Tj
+T*
+(        HOOK[HookEngine]) Tj
+T*
+(        STORE[OrchestrationStore]) Tj
+T*
+(    end) Tj
+T*
+() Tj
+T*
+(    subgraph Execution_Plane [Execution Plane]) Tj
+T*
+(        TOOLS[Tool Implementations]) Tj
+T*
+(        FS[Workspace File System / Terminal / MCP]) Tj
+T*
+(    end) Tj
+T*
+() Tj
+T*
+(    subgraph Persistence_Plane [Persistence Plane]) Tj
+T*
+(        ORCH[".orchestration/*"]) Tj
+T*
+ET
+endstream
+endobj
+13 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 3 0 R >> >> /Contents 12 0 R >>
+endobj
+14 0 obj
+<< /Length 1867 >>
+stream
+BT
+/F1 10 Tf
+42 800 Td
+12 TL
+(        ACTINT["active_intents.yaml"]) Tj
+T*
+(        SIDECAR["sidecar.yaml"]) Tj
+T*
+(        TRACE["agent_trace.jsonl"]) Tj
+T*
+(        MAP["intent_map.md"]) Tj
+T*
+(        AGENT["AGENT.md / shared brain"]) Tj
+T*
+(    end) Tj
+T*
+() Tj
+T*
+(    %% Connections) Tj
+T*
+(    U -->|interacts| WV) Tj
+T*
+(    WV -->|postMessage| WMH) Tj
+T*
+(    WMH --> CP) Tj
+T*
+(    CP --> TK) Tj
+T*
+(    TK -->|build prompt & tools| API) Tj
+T*
+(    API -->|streamed response| NTP) Tj
+T*
+(    NTP --> DISPATCH) Tj
+T*
+() Tj
+T*
+(    DISPATCH -->|preToolUse| HOOK) Tj
+T*
+(    HOOK -->|policy & state| STORE) Tj
+T*
+(    STORE --> ORCH) Tj
+T*
+(    HOOK -- allow/deny --> DISPATCH) Tj
+T*
+() Tj
+T*
+(    DISPATCH -->|execute| TOOLS) Tj
+T*
+(    TOOLS --> FS) Tj
+T*
+(    TOOLS -->|results| DISPATCH) Tj
+T*
+() Tj
+T*
+(    DISPATCH -->|postToolUse| HOOK) Tj
+T*
+(    HOOK -->|write logs| STORE) Tj
+T*
+(    STORE --> ORCH) Tj
+T*
+(    ORCH -->|data| STORE) Tj
+T*
+() Tj
+T*
+(## 11\) File Index \(Primary Implementation\)) Tj
+T*
+() Tj
+T*
+(- `src/core/prompts/system.ts`) Tj
+T*
+(- `src/core/prompts/tools/native-tools/select_active_intent.ts`) Tj
+T*
+(- `src/core/prompts/tools/native-tools/write_to_file.ts`) Tj
+T*
+(- `src/core/tools/SelectActiveIntentTool.ts`) Tj
+T*
+(- `src/core/tools/WriteToFileTool.ts`) Tj
+T*
+(- `src/core/assistant-message/presentAssistantMessage.ts`) Tj
+T*
+(- `src/hooks/HookEngine.ts`) Tj
+T*
+(- `src/hooks/OrchestrationStore.ts`) Tj
+T*
+(- `src/hooks/IntentContextService.ts`) Tj
+T*
+(- `src/core/task/Task.ts`) Tj
+T*
+(- `src/core/tools/ReadFileTool.ts`) Tj
+T*
+(- `src/core/tools/ExecuteCommandTool.ts`) Tj
+T*
+(- `src/hooks/__tests__/HookEngine.spec.ts`) Tj
+T*
+(- `src/core/assistant-message/__tests__/presentAssistantMessage-writeToFile-shim.spec.ts`) Tj
+T*
+() Tj
+T*
+(---) Tj
+T*
+() Tj
+T*
+(github link : https://github.com/Gersum/Roo-Code-10x.git) Tj
+T*
+ET
+endstream
+endobj
+15 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 3 0 R >> >> /Contents 14 0 R >>
+endobj
+xref
+0 16
+0000000000 65535 f 
+0000000015 00000 n 
+0000000064 00000 n 
+0000000156 00000 n 
+0000000226 00000 n 
+0000003302 00000 n 
+0000003428 00000 n 
+0000006076 00000 n 
+0000006202 00000 n 
+0000008794 00000 n 
+0000008920 00000 n 
+0000011524 00000 n 
+0000011652 00000 n 
+0000014567 00000 n 
+0000014695 00000 n 
+0000016615 00000 n 
+trailer
+<< /Size 16 /Root 1 0 R >>
+startxref
+16743
+%%EOF
