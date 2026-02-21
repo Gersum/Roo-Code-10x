@@ -1,0 +1,9 @@
+sidecar:
+  version: 1
+  architectural_constraints:
+    - "All mutating tool calls must map to an active intent and remain inside owned scope."
+    - "Architectural invariants are enforced by deterministic hooks, not prompt-only instructions."
+  blocked_tools: []
+  deny_mutations:
+    - path_glob: ".orchestration/**"
+      reason: "Orchestration control-plane files are hook-managed."
